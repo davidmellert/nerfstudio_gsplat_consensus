@@ -45,7 +45,7 @@ from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.utils.data_utils import identity_collate
-from nerfstudio.data.utils.dataloaders import ImageBatchStream, _undistort_image
+from nerfstudio.data.utils.dataloaders import ImageBatchStream, _undistort_image, undistort_view
 from nerfstudio.utils.misc import get_dict_to_torch, get_orig_class
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -383,20 +383,33 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         camera = self.train_dataset.cameras[0].reshape(())
         return int(camera.width[0].item() * camera.height[0].item())
 
-    def next_train(self, step: int) -> Tuple[Cameras, Dict]:
-        """Returns the next training batch
-        Returns a Camera instead of raybundle"""
-        self.train_count += 1
+    def _next_train_image_idx(self) -> int:
+        """Returns the next train image index according to the configured train camera sampler."""
+        image_idx = int(self.train_unseen_cameras.pop(0))
+        if len(self.train_unseen_cameras) == 0:
+            self.train_unseen_cameras = self.sample_train_cameras()
+        return image_idx
+
+    def _consensus_random_generator(self) -> random.Random:
+        if not hasattr(self, "_consensus_random"):
+            self._consensus_random = random.Random(self.config.train_cameras_sampling_seed + 17)
+        return self._consensus_random
+
+    def get_train_camera_and_data(self, image_idx: int) -> Tuple[Cameras, Dict]:
+        """Returns one indexed train camera/image pair from the edited train set."""
         if self.config.cache_images == "disk":
-            camera, data = next(self.iter_train_image_dataloader)[0]
+            camera, data = undistort_view(image_idx, self.train_dataset, self.config.cache_images_type)  # type: ignore
+            if camera.metadata is None:
+                camera.metadata = {}
+            camera.metadata["cam_idx"] = image_idx
+            if self.custom_image_processor:
+                camera, data = self.custom_image_processor(camera, data)
+            if camera.metadata is None:
+                camera.metadata = {}
+            camera.metadata["cam_idx"] = image_idx
             camera = camera.to(self.device)
             data = get_dict_to_torch(data, self.device)
             return camera, data
-
-        image_idx = self.train_unseen_cameras.pop(0)
-        # Make sure to re-populate the unseen cameras list if we have exhausted it
-        if len(self.train_unseen_cameras) == 0:
-            self.train_unseen_cameras = self.sample_train_cameras()
 
         data = self.cached_train[image_idx]
         # We're going to copy to make sure we don't mutate the cached dictionary.
@@ -410,6 +423,113 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             camera.metadata = {}
         camera.metadata["cam_idx"] = image_idx
         return camera, data
+
+    def _get_pose_neighbor_indices(
+        self,
+        anchor_idx: int,
+        neighbor_pool_size: int,
+        position_weight: float,
+        direction_weight: float,
+    ) -> List[int]:
+        camera_to_worlds = self.train_dataset.cameras.camera_to_worlds.float()
+        origins = camera_to_worlds[..., 3]
+        directions = torch.nn.functional.normalize(camera_to_worlds[..., :3, 2], dim=-1)
+        anchor_origin = origins[anchor_idx]
+        anchor_direction = directions[anchor_idx]
+
+        position_distances = torch.linalg.norm(origins - anchor_origin, dim=-1)
+        nonzero_position_distances = position_distances[position_distances > 1e-8]
+        if nonzero_position_distances.numel() > 0:
+            position_scale = nonzero_position_distances.median().clamp_min(1e-8)
+        else:
+            position_scale = torch.ones((), dtype=position_distances.dtype, device=position_distances.device)
+        position_score = position_distances / position_scale
+
+        direction_dot = torch.clamp((directions * anchor_direction).sum(dim=-1), -1.0, 1.0)
+        direction_score = 1.0 - direction_dot
+        pose_score = position_weight * position_score + direction_weight * direction_score
+        pose_score[anchor_idx] = torch.inf
+
+        ordered = torch.argsort(pose_score).tolist()
+        if neighbor_pool_size > 0:
+            ordered = ordered[:neighbor_pool_size]
+        return [int(idx) for idx in ordered if idx != anchor_idx]
+
+    def sample_train_view_indices(
+        self,
+        num_views: int,
+        sampling_strategy: Literal["global", "pose_neighborhood"] = "global",
+        neighbor_pool_size: int = 16,
+        position_weight: float = 1.0,
+        direction_weight: float = 0.25,
+    ) -> List[int]:
+        """Samples train image indices for one multi-view Gaussian consensus step."""
+        if num_views < 1:
+            raise ValueError("num_views must be at least 1")
+
+        anchor_idx = self._next_train_image_idx()
+        image_indices = [anchor_idx]
+        if num_views == 1 or len(self.train_dataset) == 1:
+            return image_indices
+
+        rng = self._consensus_random_generator()
+        if sampling_strategy == "pose_neighborhood":
+            neighbor_indices = self._get_pose_neighbor_indices(
+                anchor_idx=anchor_idx,
+                neighbor_pool_size=neighbor_pool_size,
+                position_weight=position_weight,
+                direction_weight=direction_weight,
+            )
+            num_neighbors = min(num_views - 1, len(neighbor_indices))
+            if num_neighbors > 0:
+                image_indices.extend(rng.sample(neighbor_indices, k=num_neighbors))
+        elif sampling_strategy != "global":
+            raise ValueError(f"Unknown train view sampling strategy: {sampling_strategy}")
+
+        seen = set(image_indices)
+        max_unique = min(num_views, len(self.train_dataset))
+        while len(image_indices) < max_unique:
+            image_idx = self._next_train_image_idx()
+            if image_idx not in seen:
+                image_indices.append(image_idx)
+                seen.add(image_idx)
+
+        while len(image_indices) < num_views:
+            image_indices.append(anchor_idx)
+        return image_indices
+
+    def next_train_views(
+        self,
+        step: int,
+        num_views: int,
+        sampling_strategy: Literal["global", "pose_neighborhood"] = "global",
+        neighbor_pool_size: int = 16,
+        position_weight: float = 1.0,
+        direction_weight: float = 0.25,
+    ) -> List[Tuple[Cameras, Dict]]:
+        """Returns one anchor train view plus optional neighboring train views."""
+        self.train_count += 1
+        image_indices = self.sample_train_view_indices(
+            num_views=num_views,
+            sampling_strategy=sampling_strategy,
+            neighbor_pool_size=neighbor_pool_size,
+            position_weight=position_weight,
+            direction_weight=direction_weight,
+        )
+        return [self.get_train_camera_and_data(image_idx) for image_idx in image_indices]
+
+    def next_train(self, step: int) -> Tuple[Cameras, Dict]:
+        """Returns the next training batch
+        Returns a Camera instead of raybundle"""
+        self.train_count += 1
+        if self.config.cache_images == "disk":
+            camera, data = next(self.iter_train_image_dataloader)[0]
+            camera = camera.to(self.device)
+            data = get_dict_to_torch(data, self.device)
+            return camera, data
+
+        image_idx = self._next_train_image_idx()
+        return self.get_train_camera_and_data(image_idx)
 
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next evaluation batch

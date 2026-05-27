@@ -41,7 +41,6 @@ from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correc
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
-from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 
@@ -62,10 +61,9 @@ def resize_image(image: torch.Tensor, d: int):
     return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0)
 
 
-@torch_compile()
 def get_viewmat(optimized_camera_to_world):
     """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    function that converts c2w to gsplat world2camera matrix
     """
     R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
     T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
@@ -166,6 +164,34 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
     mcmc_scale_reg: float = 0.01
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
+    gaussian_consensus_enabled: bool = False
+    """If True, use Gaussian soft consensus training instead of the standard single-view update."""
+    gaussian_consensus_num_views: int = 4
+    """Number of edited training views to render before one optimizer step."""
+    gaussian_consensus_max_views_per_gaussian: int = 0
+    """Maximum visible views that can influence one Gaussian per step. If 0, use all visible views."""
+    gaussian_consensus_view_sampling: Literal["global", "pose_neighborhood"] = "pose_neighborhood"
+    """How to sample the edited views used in one consensus optimizer step."""
+    gaussian_consensus_neighbor_pool_size: int = 16
+    """Number of nearest edited train views to sample extra consensus views from."""
+    gaussian_consensus_position_weight: float = 1.0
+    """Weight for camera-center distance when ranking nearby edited train views."""
+    gaussian_consensus_direction_weight: float = 0.25
+    """Weight for viewing-direction distance when ranking nearby edited train views."""
+    gaussian_consensus_aggregator: Literal["mean", "cosine"] = "cosine"
+    """How to aggregate visible per-view Gaussian gradients."""
+    gaussian_consensus_min_alignment: float = 0.0
+    """Minimum cosine alignment used by the cosine aggregator. 0 ignores opposing view gradients."""
+    gaussian_consensus_trainable_param_groups: Tuple[str, ...] = ("features_dc", "features_rest")
+    """Gaussian optimizer groups updated by consensus. Defaults to appearance-only editing."""
+    gaussian_consensus_disable_refinement: bool = True
+    """If True, disable gsplat densification/culling/reset callbacks during consensus optimization."""
+    gaussian_consensus_store_grads_on_cpu: bool = True
+    """If True, store per-view gradients on CPU and aggregate them in chunks to reduce VRAM use."""
+    gaussian_consensus_gaussian_chunk_size: int = 65536
+    """Number of Gaussians to aggregate at once for each optimizer group."""
+    gaussian_consensus_eps: float = 1e-8
+    """Small value used for consensus visibility and normalization checks."""
 
 
 class SplatfactoModel(Model):
@@ -364,6 +390,8 @@ class SplatfactoModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
+        if self.config.gaussian_consensus_enabled and self.config.gaussian_consensus_disable_refinement:
+            return
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(
                 params=self.gauss_params,
@@ -573,7 +601,10 @@ class SplatfactoModel(Model):
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
-        if self.training:
+        if (
+            self.training
+            and not (self.config.gaussian_consensus_enabled and self.config.gaussian_consensus_disable_refinement)
+        ):
             self.strategy.step_pre_backward(
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )

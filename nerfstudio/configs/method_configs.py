@@ -18,6 +18,7 @@ Put all the method implementations in one location.
 
 from __future__ import annotations
 
+import copy
 from collections import OrderedDict
 from typing import Dict, Union
 
@@ -82,6 +83,7 @@ descriptions = {
     "neus-facto": "Implementation of NeuS-Facto. (slow)",
     "splatfacto": "Gaussian Splatting model",
     "splatfacto-big": "Larger version of Splatfacto with higher quality.",
+    "splatfacto-gaussian-consensus": "Splatfacto edit refinement with per-Gaussian soft consensus.",
 }
 
 method_configs["nerfacto"] = TrainerConfig(
@@ -766,6 +768,43 @@ method_configs["splatfacto-mcmc"] = TrainerConfig(
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
 )
+
+
+method_configs["splatfacto-gaussian-consensus"] = copy.deepcopy(method_configs["splatfacto"])
+method_configs["splatfacto-gaussian-consensus"].method_name = "splatfacto-gaussian-consensus"
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_enabled = True  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_num_views = 4  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_max_views_per_gaussian = 0  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_view_sampling = "pose_neighborhood"  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_neighbor_pool_size = 16  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_position_weight = 1.0  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_direction_weight = 0.25  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_aggregator = "cosine"  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_trainable_param_groups = (  # type: ignore[attr-defined]
+    "features_dc",
+    "features_rest",
+)
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.model.gaussian_consensus_disable_refinement = True  # type: ignore[attr-defined]
 
 
 def merge_methods(methods, method_descriptions, new_methods, new_descriptions, overwrite=True):
