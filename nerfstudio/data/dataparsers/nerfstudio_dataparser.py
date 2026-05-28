@@ -51,6 +51,12 @@ class NerfstudioDataParserConfig(DataParserConfig):
     """How much to scale the camera origins by."""
     downscale_factor: Optional[int] = None
     """How much to downscale images. If not set, images are chosen such that the max dimension is <1600px."""
+    downscale_rounding_mode: Literal["floor", "round", "ceil"] = "floor"
+    """How to round image dimensions when creating missing downscaled images."""
+    auto_downscale_missing_images: bool = True
+    """If True, create missing images_N files from the original image files."""
+    skip_missing_images: bool = False
+    """If True, skip frames whose final image path is missing instead of failing."""
     scene_scale: float = 1.0
     """How much to scale the region of interest by."""
     orientation_method: Literal["pca", "up", "vertical", "none"] = "up"
@@ -253,6 +259,27 @@ class Nerfstudio(DataParser):
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
         depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
 
+        if self.config.skip_missing_images:
+            def has_all_files(idx: int) -> bool:
+                if not image_filenames[idx].exists():
+                    return False
+                if len(mask_filenames) > 0 and not mask_filenames[idx].exists():
+                    return False
+                if len(depth_filenames) > 0 and not depth_filenames[idx].exists():
+                    return False
+                return True
+
+            valid_positions = [idx for idx in range(len(image_filenames)) if has_all_files(idx)]
+            skipped = len(image_filenames) - len(valid_positions)
+            if skipped > 0:
+                CONSOLE.log(f"[yellow]Skipping {skipped} {split} frames with missing files.")
+            image_filenames = [image_filenames[i] for i in valid_positions]
+            mask_filenames = [mask_filenames[i] for i in valid_positions] if len(mask_filenames) > 0 else []
+            depth_filenames = [depth_filenames[i] for i in valid_positions] if len(depth_filenames) > 0 else []
+            indices = np.array([indices[i] for i in valid_positions], dtype=np.int32)
+            if len(image_filenames) == 0:
+                raise RuntimeError(f"No images remain for split {split} after filtering missing files.")
+
         idx_tensor = torch.tensor(indices, dtype=torch.long)
         poses = poses[idx_tensor]
 
@@ -419,6 +446,40 @@ class Nerfstudio(DataParser):
         )
         return dataparser_outputs
 
+    def _get_downscaled_size(self, width: int, height: int) -> Tuple[int, int]:
+        mode = self.config.downscale_rounding_mode
+        assert self.downscale_factor is not None
+        if mode == "floor":
+            return width // self.downscale_factor, height // self.downscale_factor
+        if mode == "round":
+            return round(width / self.downscale_factor), round(height / self.downscale_factor)
+        if mode == "ceil":
+            return int(np.ceil(width / self.downscale_factor)), int(np.ceil(height / self.downscale_factor))
+        raise ValueError(f"Unknown downscale_rounding_mode {mode}")
+
+    def _maybe_downscale_file(
+        self,
+        filepath: Path,
+        data_dir: Path,
+        output_path: Path,
+        downsample_folder_prefix: str,
+    ) -> None:
+        if output_path.exists() or self.config.skip_missing_images or not self.config.auto_downscale_missing_images:
+            return
+
+        source_path = data_dir / filepath
+        if not source_path.exists():
+            return
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(source_path) as image:
+            width, height = image.size
+            downscaled_size = self._get_downscaled_size(width, height)
+            resample = (
+                Image.Resampling.BILINEAR if downsample_folder_prefix == "images_" else Image.Resampling.NEAREST
+            )
+            image.resize(downscaled_size, resample=resample).save(output_path)
+
     def _load_3D_points(self, ply_file_path: Path, transform_matrix: torch.Tensor, scale_factor: float):
         """Loads point clouds positions and colors from .ply
 
@@ -487,5 +548,7 @@ class Nerfstudio(DataParser):
             assert self.downscale_factor is not None
 
         if self.downscale_factor > 1:
-            return data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
+            fname = data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
+            self._maybe_downscale_file(filepath, data_dir, fname, downsample_folder_prefix)
+            return fname
         return data_dir / filepath

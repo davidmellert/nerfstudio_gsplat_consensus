@@ -89,6 +89,8 @@ class TrainerConfig(ExperimentConfig):
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
     start_paused: bool = False
     """Whether to start the training in a paused state."""
+    downscale_factor: Optional[int] = None
+    """Override the dataparser image downscale factor, e.g. 8 to use/create images_8."""
 
 
 class Trainer:
@@ -156,6 +158,12 @@ class Trainer:
                 'test': loads train/test datasets into memory
                 'inference': does not load any dataset into memory
         """
+        if self.config.downscale_factor is not None:
+            dataparser = self.config.pipeline.datamanager.dataparser
+            if not hasattr(dataparser, "downscale_factor"):
+                raise ValueError("The configured dataparser does not support downscale_factor.")
+            dataparser.downscale_factor = self.config.downscale_factor
+
         self.pipeline = self.config.pipeline.setup(
             device=self.device,
             test_mode=test_mode,
@@ -300,7 +308,7 @@ class Trainer:
                     )
 
                 # Do not perform evaluation if there are no validation images
-                if self.pipeline.datamanager.eval_dataset:
+                if self.pipeline.datamanager.eval_dataset and len(self.pipeline.datamanager.eval_dataset) > 0:
                     with self.train_lock:
                         self.eval_iteration(step)
 
@@ -434,6 +442,7 @@ class Trainer:
             self._start_step = loaded_state["step"] + 1
             # load the checkpoints for pipeline, optimizers, and gradient scalar
             self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
+            self.optimizers.update_parameters(self.pipeline.get_param_groups())
             self.optimizers.load_optimizers(loaded_state["optimizers"])
             if "schedulers" in loaded_state and self.config.load_scheduler:
                 self.optimizers.load_schedulers(loaded_state["schedulers"])
@@ -445,6 +454,7 @@ class Trainer:
             self._start_step = loaded_state["step"] + 1
             # load the checkpoints for pipeline, optimizers, and gradient scalar
             self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
+            self.optimizers.update_parameters(self.pipeline.get_param_groups())
             self.optimizers.load_optimizers(loaded_state["optimizers"])
             if "schedulers" in loaded_state and self.config.load_scheduler:
                 self.optimizers.load_schedulers(loaded_state["schedulers"])
@@ -610,7 +620,10 @@ class Trainer:
                 if not isinstance(value, torch.Tensor):
                     value = torch.tensor(value, device=self.device)
                 values.append(value.detach())
-            averaged[key] = torch.stack(values).mean()
+            stacked = torch.stack(values)
+            if not stacked.is_floating_point() and not stacked.is_complex():
+                stacked = stacked.float()
+            averaged[key] = stacked.mean()
         return averaged
 
     def _iter_gaussian_consensus_train_views(self, step: int, config):
@@ -726,6 +739,114 @@ class Trainer:
         loss = torch.stack(losses).mean()
         return loss, loss_dict, metrics_dict  # type: ignore
 
+    def _update_gaussian_batch_refinement_state(self, info: Dict[str, torch.Tensor]) -> None:
+        model = self.pipeline.model
+        strategy = getattr(model, "strategy", None)
+        if strategy is None or not hasattr(strategy, "_update_state"):
+            raise RuntimeError("Sequential Gaussian batch refinement currently requires the default gsplat strategy.")
+        strategy._update_state(model.gauss_params, model.strategy_state, info, packed=False)
+
+    def _step_gaussian_batch_refinement(self, step: int, info: Dict[str, torch.Tensor]) -> None:
+        model = self.pipeline.model
+        strategy = getattr(model, "strategy", None)
+        if strategy is None or not hasattr(strategy, "_update_state"):
+            raise RuntimeError("Sequential Gaussian batch refinement currently requires the default gsplat strategy.")
+        strategy.step_post_backward(
+            params=model.gauss_params,
+            optimizers=model.optimizers,
+            state=model.strategy_state,
+            step=step,
+            info=info,
+            packed=False,
+        )
+
+    @profiler.time_function
+    def gaussian_batch_train_iteration(self, step: int) -> TRAIN_INTERATION_OUTPUT:
+        """Run a true multi-view batch while rendering each view sequentially.
+
+        This uses the Gaussian consensus view sampler and trainable parameter groups, but the gradient is the ordinary
+        average of the per-view losses. There is no per-Gaussian visibility filtering or soft-consensus weighting.
+        """
+        config = self._get_gaussian_consensus_config()
+        assert config is not None
+        if self.world_size > 1:
+            raise RuntimeError(
+                "Sequential Gaussian batch training is currently implemented for single-process training only."
+            )
+        if config.gaussian_consensus_num_views < 1:
+            raise RuntimeError("gaussian_consensus_num_views must be at least 1.")
+
+        trainable_groups = self._get_gaussian_consensus_param_groups()
+        refine_batch = not config.gaussian_consensus_disable_refinement
+        if refine_batch:
+            required_groups = {"means", "scales", "quats", "features_dc", "features_rest", "opacities"}
+            missing_groups = sorted(required_groups.difference(trainable_groups))
+            if missing_groups:
+                raise RuntimeError(
+                    "Sequential Gaussian batch refinement requires all Gaussian parameter groups to be trainable. "
+                    f"Missing groups: {missing_groups}"
+                )
+        loss_dicts: List[Dict[str, torch.Tensor]] = []
+        metrics_dicts: List[Dict[str, torch.Tensor]] = []
+        losses: List[torch.Tensor] = []
+        refinement_infos: List[Dict[str, torch.Tensor]] = []
+        cpu_or_cuda_str: str = self.device.split(":")[0]
+        cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
+        batch_size = config.gaussian_consensus_num_views
+
+        self.optimizers.zero_grad_all()
+        with self._only_consensus_groups_require_grad(trainable_groups):
+            for ray_bundle, batch in self._iter_gaussian_consensus_train_views(step, config):
+                with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+                    model_outputs = self.pipeline._model(ray_bundle)
+                    metrics_dict = self.pipeline.model.get_metrics_dict(model_outputs, batch)
+                    loss_dict = self.pipeline.model.get_loss_dict(model_outputs, batch, metrics_dict)
+                    loss = functools.reduce(torch.add, loss_dict.values())
+                    loss_for_backward = loss / batch_size
+
+                self.grad_scaler.scale(loss_for_backward).backward()  # type: ignore
+                if refine_batch:
+                    refinement_infos.append(self.pipeline.model.info)
+                loss_dicts.append({key: value.detach() for key, value in loss_dict.items()})
+                metrics_dicts.append(metrics_dict)
+                losses.append(loss.detach())
+                del model_outputs, loss_dict, metrics_dict, loss, loss_for_backward, ray_bundle, batch
+
+        needs_step = [
+            group
+            for group in trainable_groups
+            if step % self.gradient_accumulation_steps[group] == self.gradient_accumulation_steps[group] - 1
+        ]
+        self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
+
+        metrics_dict = self._mean_logged_dicts(metrics_dicts)
+        if self.config.log_gradients:
+            total_grad = 0
+            for tag, value in self.pipeline.model.named_parameters():
+                assert tag != "Total"
+                if value.grad is not None:
+                    grad = value.grad.norm()
+                    metrics_dict[f"Gradients/{tag}"] = grad
+                    total_grad += grad
+            metrics_dict["Gradients/Total"] = cast(torch.Tensor, total_grad)
+
+        scale = self.grad_scaler.get_scale()
+        self.grad_scaler.update()
+        if scale <= self.grad_scaler.get_scale():
+            for group in needs_step:
+                if group in self.optimizers.schedulers:
+                    self.optimizers.scheduler_step(group)
+
+        if refine_batch and len(refinement_infos) > 0:
+            for info in refinement_infos[:-1]:
+                self._update_gaussian_batch_refinement_state(info)
+            self._step_gaussian_batch_refinement(step, refinement_infos[-1])
+
+        loss_dict = self._mean_logged_dicts(loss_dicts)
+        metrics_dict["Batch/num_views"] = torch.tensor(float(batch_size), device=self.device)
+        loss = torch.stack(losses).mean()
+        return loss, loss_dict, metrics_dict  # type: ignore
+
     @profiler.time_function
     def train_iteration(self, step: int) -> TRAIN_INTERATION_OUTPUT:
         """Run one iteration with a batch of inputs. Returns dictionary of model losses.
@@ -734,8 +855,14 @@ class Trainer:
             step: Current training step.
         """
 
-        if self._get_gaussian_consensus_config() is not None:
-            return self.gaussian_consensus_train_iteration(step)
+        gaussian_consensus_config = self._get_gaussian_consensus_config()
+        if gaussian_consensus_config is not None:
+            gaussian_consensus_mode = getattr(gaussian_consensus_config, "gaussian_consensus_mode", "consensus")
+            if gaussian_consensus_mode == "consensus":
+                return self.gaussian_consensus_train_iteration(step)
+            if gaussian_consensus_mode == "batch":
+                return self.gaussian_batch_train_iteration(step)
+            raise RuntimeError(f"Unknown Gaussian consensus training mode: {gaussian_consensus_mode}")
 
         needs_zero = [
             group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0

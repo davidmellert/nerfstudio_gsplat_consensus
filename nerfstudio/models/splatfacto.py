@@ -166,6 +166,8 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
     gaussian_consensus_enabled: bool = False
     """If True, use Gaussian soft consensus training instead of the standard single-view update."""
+    gaussian_consensus_mode: Literal["consensus", "batch"] = "consensus"
+    """Training mode for multi-view edit refinement. "batch" averages full per-view gradients sequentially."""
     gaussian_consensus_num_views: int = 4
     """Number of edited training views to render before one optimizer step."""
     gaussian_consensus_max_views_per_gaussian: int = 0
@@ -390,7 +392,9 @@ class SplatfactoModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
-        if self.config.gaussian_consensus_enabled and self.config.gaussian_consensus_disable_refinement:
+        if self.config.gaussian_consensus_enabled and (
+            self.config.gaussian_consensus_disable_refinement or self.config.gaussian_consensus_mode == "batch"
+        ):
             return
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(

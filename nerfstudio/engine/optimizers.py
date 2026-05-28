@@ -192,6 +192,20 @@ class Optimizers:
             lr = scheduler.get_last_lr()[0]
             writer.put_scalar(name=f"learning_rate/{param_group_name}", scalar=lr, step=step)
 
+    def update_parameters(self, param_groups: Dict[str, List[Parameter]]) -> None:
+        """Update optimizer param-group references after a model replaces Parameters."""
+        for param_group_name, params in param_groups.items():
+            if param_group_name not in self.optimizers:
+                continue
+            optimizer = self.optimizers[param_group_name]
+            if len(optimizer.param_groups) != 1:
+                raise RuntimeError(
+                    f"Expected one optimizer param group for '{param_group_name}', "
+                    f"got {len(optimizer.param_groups)}."
+                )
+            optimizer.param_groups[0]["params"] = list(params)
+            self.parameters[param_group_name] = params
+
     def load_optimizers(self, loaded_state: Dict[str, Any]) -> None:
         """Helper to load the optimizer state from previous checkpoint
 

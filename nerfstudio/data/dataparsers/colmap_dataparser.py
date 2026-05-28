@@ -59,6 +59,10 @@ class ColmapDataParserConfig(DataParserConfig):
     """How much to downscale images. If not set, images are chosen such that the max dimension is <1600px."""
     downscale_rounding_mode: Literal["floor", "round", "ceil"] = "floor"
     """How to round downscale image height and Image width."""
+    auto_downscale_missing_images: bool = True
+    """If True, create missing images_N files from the original image files without prompting."""
+    skip_missing_images: bool = False
+    """If True, skip frames whose final image path is missing instead of failing."""
     tiling_factor: int = 1
     """Tile images into n^2 equal-resolution images, where n is this number. n | H, n | W for image with resolution WxH"""
     scene_scale: float = 1.0
@@ -335,6 +339,7 @@ class ColmapDataParser(DataParser):
         )
 
         num_tiles = self.config.tiling_factor**2
+        source_indices = [int(i) for i in indices for _ in range(num_tiles)]
 
         image_filenames = [image_filenames[i * num_tiles + j] for i in indices for j in range(num_tiles)]
         mask_filenames = (
@@ -348,8 +353,29 @@ class ColmapDataParser(DataParser):
             else []
         )
 
-        idx_tensor = torch.tensor(indices, dtype=torch.long)
-        poses = poses[idx_tensor].repeat_interleave(num_tiles, dim=0)
+        if self.config.skip_missing_images:
+            def has_all_files(idx: int) -> bool:
+                if not image_filenames[idx].exists():
+                    return False
+                if len(mask_filenames) > 0 and not mask_filenames[idx].exists():
+                    return False
+                if len(depth_filenames) > 0 and not depth_filenames[idx].exists():
+                    return False
+                return True
+
+            valid_positions = [idx for idx in range(len(image_filenames)) if has_all_files(idx)]
+            skipped = len(image_filenames) - len(valid_positions)
+            if skipped > 0:
+                CONSOLE.log(f"[yellow]Skipping {skipped} {split} frames with missing files.")
+            image_filenames = [image_filenames[i] for i in valid_positions]
+            mask_filenames = [mask_filenames[i] for i in valid_positions] if len(mask_filenames) > 0 else []
+            depth_filenames = [depth_filenames[i] for i in valid_positions] if len(depth_filenames) > 0 else []
+            source_indices = [source_indices[i] for i in valid_positions]
+            if len(image_filenames) == 0:
+                raise RuntimeError(f"No images remain for split {split} after filtering missing files.")
+
+        idx_tensor = torch.tensor(source_indices, dtype=torch.long)
+        poses = poses[idx_tensor]
 
         # in x,y,z order
         # assumes that the scene is centered at the origin
@@ -360,13 +386,13 @@ class ColmapDataParser(DataParser):
             )
         )
 
-        fx = torch.tensor(fx, dtype=torch.float32)[idx_tensor].repeat_interleave(num_tiles)
-        fy = torch.tensor(fy, dtype=torch.float32)[idx_tensor].repeat_interleave(num_tiles)
-        cx = torch.tensor(cx, dtype=torch.float32)[idx_tensor].repeat_interleave(num_tiles)
-        cy = torch.tensor(cy, dtype=torch.float32)[idx_tensor].repeat_interleave(num_tiles)
-        height = torch.tensor(height, dtype=torch.int32)[idx_tensor].repeat_interleave(num_tiles)
-        width = torch.tensor(width, dtype=torch.int32)[idx_tensor].repeat_interleave(num_tiles)
-        distortion_params = torch.stack(distort, dim=0)[idx_tensor].repeat_interleave(num_tiles, dim=0)
+        fx = torch.tensor(fx, dtype=torch.float32)[idx_tensor]
+        fy = torch.tensor(fy, dtype=torch.float32)[idx_tensor]
+        cx = torch.tensor(cx, dtype=torch.float32)[idx_tensor]
+        cy = torch.tensor(cy, dtype=torch.float32)[idx_tensor]
+        height = torch.tensor(height, dtype=torch.int32)[idx_tensor]
+        width = torch.tensor(width, dtype=torch.int32)[idx_tensor]
+        distortion_params = torch.stack(distort, dim=0)[idx_tensor]
 
         cameras = Cameras(
             fx=fx,
@@ -654,56 +680,97 @@ class ColmapDataParser(DataParser):
                 CONSOLE.log(f"Using image downscale factor of {self._downscale_factor}")
             else:
                 self._downscale_factor = self.config.downscale_factor
-            if self._downscale_factor > 1 and not all(
-                get_fname(self.config.data / self.config.images_path, fp).parent.exists() for fp in image_filenames
-            ):
-                # Downscaled images not found
-                # Ask if user wants to downscale the images automatically here
-                CONSOLE.print(
-                    f"[bold red]Downscaled images do not exist for factor of {self._downscale_factor}.[/bold red]"
-                )
-                if Confirm.ask(
-                    f"\nWould you like to downscale the images using '{self.config.downscale_rounding_mode}' rounding mode now?",
-                    default=False,
-                    console=CONSOLE,
-                ):
-                    # Install the method
-                    self._downscale_images(
-                        image_filenames,
-                        partial(get_fname, self.config.data / self.config.images_path),
-                        self._downscale_factor,
-                        self.config.downscale_rounding_mode,
-                        nearest_neighbor=False,
+            if self._downscale_factor > 1:
+                missing_images = [
+                    fp
+                    for fp in image_filenames
+                    if not get_fname(self.config.data / self.config.images_path, fp).exists()
+                ]
+                missing_masks: List[Path] = []
+                missing_depths: List[Path] = []
+                if len(mask_filenames) > 0:
+                    assert self.config.masks_path is not None
+                    missing_masks = [
+                        fp
+                        for fp in mask_filenames
+                        if not get_fname(self.config.data / self.config.masks_path, fp).exists()
+                    ]
+                if len(depth_filenames) > 0:
+                    assert self.config.depths_path is not None
+                    missing_depths = [
+                        fp
+                        for fp in depth_filenames
+                        if not get_fname(self.config.data / self.config.depths_path, fp).exists()
+                    ]
+
+                missing_count = len(missing_images) + len(missing_masks) + len(missing_depths)
+                should_downscale = False
+                if missing_count > 0 and self.config.skip_missing_images:
+                    CONSOLE.log(
+                        f"[yellow]Found {len(missing_images)} missing downscaled images; "
+                        "leaving them for skip_missing_images filtering."
                     )
-                    if len(mask_filenames) > 0:
+                elif missing_count > 0 and self.config.auto_downscale_missing_images:
+                    CONSOLE.log(
+                        f"[yellow]Creating {missing_count} missing downscaled files for factor "
+                        f"{self._downscale_factor}."
+                    )
+                    should_downscale = True
+                elif missing_count > 0:
+                    CONSOLE.print(
+                        f"[bold red]Downscaled images do not exist for factor of {self._downscale_factor}.[/bold red]"
+                    )
+                    should_downscale = Confirm.ask(
+                        f"\nWould you like to downscale the missing files using "
+                        f"'{self.config.downscale_rounding_mode}' rounding mode now?",
+                        default=False,
+                        console=CONSOLE,
+                    )
+                    if not should_downscale:
+                        sys.exit(1)
+
+                if should_downscale:
+                    if len(missing_images) > 0:
+                        self._downscale_images(
+                            missing_images,
+                            partial(get_fname, self.config.data / self.config.images_path),
+                            self._downscale_factor,
+                            self.config.downscale_rounding_mode,
+                            nearest_neighbor=False,
+                        )
+                    if len(missing_masks) > 0:
                         assert self.config.masks_path is not None
                         self._downscale_images(
-                            mask_filenames,
+                            missing_masks,
                             partial(get_fname, self.config.data / self.config.masks_path),
                             self._downscale_factor,
                             self.config.downscale_rounding_mode,
                             nearest_neighbor=True,
                         )
-                    if len(depth_filenames) > 0:
+                    if len(missing_depths) > 0:
                         assert self.config.depths_path is not None
                         self._downscale_images(
-                            depth_filenames,
+                            missing_depths,
                             partial(get_fname, self.config.data / self.config.depths_path),
                             self._downscale_factor,
                             self.config.downscale_rounding_mode,
                             nearest_neighbor=True,
                         )
-                else:
-                    sys.exit(1)
 
         # Return transformed filenames
         if self._downscale_factor > 1:
-            image_filenames = [get_fname(self.config.data / self.config.images_path, fp) for fp in image_filenames]
+            image_filenames = [
+                get_fname(self.config.data / self.config.images_path, fp) for fp in image_filenames
+            ]
             if len(mask_filenames) > 0:
                 assert self.config.masks_path is not None
-                mask_filenames = [get_fname(self.config.data / self.config.masks_path, fp) for fp in mask_filenames]
+                mask_filenames = [
+                    get_fname(self.config.data / self.config.masks_path, fp) for fp in mask_filenames
+                ]
             if len(depth_filenames) > 0:
                 assert self.config.depths_path is not None
-                depth_filenames = [get_fname(self.config.data / self.config.depths_path, fp) for fp in depth_filenames]
+                depth_filenames = [
+                    get_fname(self.config.data / self.config.depths_path, fp) for fp in depth_filenames
+                ]
         assert isinstance(self._downscale_factor, int)
         return image_filenames, mask_filenames, depth_filenames, self._downscale_factor

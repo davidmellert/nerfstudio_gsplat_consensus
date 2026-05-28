@@ -32,6 +32,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatama
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager, ParallelDataManagerConfig
 from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManagerConfig
 from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
+from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
 from nerfstudio.data.dataparsers.dnerf_dataparser import DNeRFDataParserConfig
 from nerfstudio.data.dataparsers.instant_ngp_dataparser import InstantNGPDataParserConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
@@ -83,7 +84,19 @@ descriptions = {
     "neus-facto": "Implementation of NeuS-Facto. (slow)",
     "splatfacto": "Gaussian Splatting model",
     "splatfacto-big": "Larger version of Splatfacto with higher quality.",
+    "splatfacto-colmap": "Gaussian Splatting model using a raw COLMAP reconstruction.",
     "splatfacto-gaussian-consensus": "Splatfacto edit refinement with per-Gaussian soft consensus.",
+    "splatfacto-gaussian-consensus-colmap": "Gaussian consensus edit refinement using a raw COLMAP reconstruction.",
+    "splatfacto-gaussian-batch": "Splatfacto edit refinement with true sequential multi-view batches.",
+    "splatfacto-gaussian-batch-colmap": (
+        "Sequential multi-view batch edit refinement using a raw COLMAP reconstruction."
+    ),
+    "splatfacto-gaussian-batch-densify": (
+        "Sequential multi-view batch refinement with gsplat densification enabled."
+    ),
+    "splatfacto-gaussian-batch-densify-colmap": (
+        "Sequential multi-view batch refinement with densification using a raw COLMAP reconstruction."
+    ),
 }
 
 method_configs["nerfacto"] = TrainerConfig(
@@ -805,6 +818,77 @@ method_configs[
 method_configs[
     "splatfacto-gaussian-consensus"
 ].pipeline.model.gaussian_consensus_disable_refinement = True  # type: ignore[attr-defined]
+method_configs["splatfacto-gaussian-consensus"].steps_per_eval_batch = 0
+method_configs["splatfacto-gaussian-consensus"].steps_per_eval_image = 0
+method_configs["splatfacto-gaussian-consensus"].steps_per_eval_all_images = 0
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.datamanager.dataparser.skip_missing_images = True  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.datamanager.dataparser.auto_downscale_missing_images = False  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus"
+].pipeline.datamanager.dataparser.eval_mode = "all"  # type: ignore[attr-defined]
+
+method_configs["splatfacto-colmap"] = copy.deepcopy(method_configs["splatfacto"])
+method_configs["splatfacto-colmap"].method_name = "splatfacto-colmap"
+method_configs["splatfacto-colmap"].pipeline.datamanager.dataparser = ColmapDataParserConfig(load_3D_points=True)
+
+method_configs["splatfacto-gaussian-consensus-colmap"] = copy.deepcopy(
+    method_configs["splatfacto-gaussian-consensus"]
+)
+method_configs["splatfacto-gaussian-consensus-colmap"].method_name = "splatfacto-gaussian-consensus-colmap"
+method_configs["splatfacto-gaussian-consensus-colmap"].pipeline.datamanager.dataparser = ColmapDataParserConfig(
+    load_3D_points=True,
+    skip_missing_images=True,
+    auto_downscale_missing_images=False,
+    eval_mode="all",
+)
+
+method_configs["splatfacto-gaussian-batch"] = copy.deepcopy(method_configs["splatfacto-gaussian-consensus"])
+method_configs["splatfacto-gaussian-batch"].method_name = "splatfacto-gaussian-batch"
+method_configs[
+    "splatfacto-gaussian-batch"
+].pipeline.model.gaussian_consensus_mode = "batch"  # type: ignore[attr-defined]
+
+method_configs["splatfacto-gaussian-batch-colmap"] = copy.deepcopy(method_configs["splatfacto-gaussian-batch"])
+method_configs["splatfacto-gaussian-batch-colmap"].method_name = "splatfacto-gaussian-batch-colmap"
+method_configs["splatfacto-gaussian-batch-colmap"].pipeline.datamanager.dataparser = ColmapDataParserConfig(
+    load_3D_points=True,
+    skip_missing_images=True,
+    auto_downscale_missing_images=False,
+    eval_mode="all",
+)
+
+method_configs["splatfacto-gaussian-batch-densify"] = copy.deepcopy(method_configs["splatfacto-gaussian-batch"])
+method_configs["splatfacto-gaussian-batch-densify"].method_name = "splatfacto-gaussian-batch-densify"
+method_configs[
+    "splatfacto-gaussian-batch-densify"
+].pipeline.model.gaussian_consensus_disable_refinement = False  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-batch-densify"
+].pipeline.model.gaussian_consensus_trainable_param_groups = (  # type: ignore[attr-defined]
+    "means",
+    "scales",
+    "quats",
+    "features_dc",
+    "features_rest",
+    "opacities",
+)
+
+method_configs["splatfacto-gaussian-batch-densify-colmap"] = copy.deepcopy(
+    method_configs["splatfacto-gaussian-batch-densify"]
+)
+method_configs["splatfacto-gaussian-batch-densify-colmap"].method_name = (
+    "splatfacto-gaussian-batch-densify-colmap"
+)
+method_configs["splatfacto-gaussian-batch-densify-colmap"].pipeline.datamanager.dataparser = ColmapDataParserConfig(
+    load_3D_points=True,
+    skip_missing_images=True,
+    auto_downscale_missing_images=False,
+    eval_mode="all",
+)
 
 
 def merge_methods(methods, method_descriptions, new_methods, new_descriptions, overwrite=True):

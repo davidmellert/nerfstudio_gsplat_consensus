@@ -149,6 +149,23 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         assert len(self.train_unseen_cameras) > 0, "No data found in dataset"
         super().__init__()
 
+    @staticmethod
+    def _set_camera_resolution_from_image(cameras: Cameras, image_idx: int, image: torch.Tensor) -> None:
+        """Keep camera intrinsics/render size aligned with the supervision image tensor."""
+        image_width = image.shape[1]
+        image_height = image.shape[0]
+        camera_width = float(cameras.width[image_idx].item())
+        camera_height = float(cameras.height[image_idx].item())
+        if camera_width > 0 and camera_height > 0:
+            scale_x = image_width / camera_width
+            scale_y = image_height / camera_height
+            cameras.fx[image_idx] *= scale_x
+            cameras.cx[image_idx] *= scale_x
+            cameras.fy[image_idx] *= scale_y
+            cameras.cy[image_idx] *= scale_y
+        cameras.width[image_idx] = image_width
+        cameras.height[image_idx] = image_height
+
     def sample_train_cameras(self):
         """Return a list of camera indices sampled using the strategy specified by
         self.config.train_cameras_sampling_strategy"""
@@ -212,11 +229,8 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
 
         def undistort_idx(idx: int) -> Dict[str, torch.Tensor]:
             data = dataset.get_data(idx, image_type=self.config.cache_images_type)
+            self._set_camera_resolution_from_image(dataset.cameras, idx, data["image"])
             camera = dataset.cameras[idx].reshape(())
-            assert data["image"].shape[1] == camera.width.item() and data["image"].shape[0] == camera.height.item(), (
-                f"The size of image ({data['image'].shape[1]}, {data['image'].shape[0]}) loaded "
-                f"does not match the camera parameters ({camera.width.item(), camera.height.item()})"
-            )
             if camera.distortion_params is None or torch.all(camera.distortion_params == 0):
                 return data
             K = camera.get_intrinsics_matrices().numpy()
