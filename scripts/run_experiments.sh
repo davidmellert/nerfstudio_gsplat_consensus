@@ -66,13 +66,13 @@ echo ""
 echo ">>> Step 2: Normal fine-tuning (1 view, no DC reg)..."
 ns-train splatfacto-gaussian-batch-colmap \
   --data "$DATA" \
-  --downscale-factor "$DOWNSCALE" \
   --load-dir "$CKPT_DIR" \
   --max-num-iterations "$FINETUNE_ITERS" \
   --pipeline.datamanager.cache-images cpu \
   --pipeline.model.gaussian-consensus-num-views 1 \
   --vis tensorboard \
   colmap --images-path "$EDITED_IMAGES" \
+  --downscale-factor "$DOWNSCALE" \
   --skip-missing-images True \
   --auto-downscale-missing-images False \
   --eval-mode all
@@ -91,7 +91,6 @@ echo ""
 echo ">>> Step 3: Fine-tuning with DC regularization (4 views)..."
 ns-train splatfacto-gaussian-batch-colmap \
   --data "$DATA" \
-  --downscale-factor "$DOWNSCALE" \
   --load-dir "$CKPT_DIR" \
   --max-num-iterations "$FINETUNE_ITERS" \
   --pipeline.datamanager.cache-images cpu \
@@ -100,6 +99,7 @@ ns-train splatfacto-gaussian-batch-colmap \
   --pipeline.model.dc-regularization-weight 0.01 \
   --vis tensorboard \
   colmap --images-path "$EDITED_IMAGES" \
+  --downscale-factor "$DOWNSCALE" \
   --skip-missing-images True \
   --auto-downscale-missing-images False \
   --eval-mode all
