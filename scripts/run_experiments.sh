@@ -75,17 +75,17 @@ ns-render camera-path \
   --output-path renders/bicycle_normal_finetune.mp4
 
 # ----------------------------------------------------------
-# Step 3: Single-view fine-tuning + DC regularization
+# Step 3: Multi-view batch fine-tuning + DC regularization
 # ----------------------------------------------------------
 echo ""
-echo ">>> Step 3: Fine-tuning with DC regularization (1 view)..."
+echo ">>> Step 3: Fine-tuning with DC regularization (4 views)..."
 ns-train splatfacto-gaussian-batch-colmap \
   --data "$DATA" \
   --downscale-factor "$DOWNSCALE" \
   --load-dir "$CKPT_DIR" \
   --max-num-iterations "$FINETUNE_ITERS" \
   --pipeline.datamanager.cache-images cpu \
-  --pipeline.model.gaussian-consensus-num-views 1 \
+  --pipeline.model.gaussian-consensus-num-views 4 \
   --pipeline.model.dc-regularization-enabled True \
   --pipeline.model.dc-regularization-weight 0.01 \
   --vis tensorboard \
