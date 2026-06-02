@@ -2,21 +2,16 @@
 set -e
 
 # ============================================================
-# Experiment pipeline: baseline + fine-tuning comparison
-# Run with: nohup bash scripts/run_experiments.sh > experiments.log 2>&1 &
-# Reconnect later and check: tail -f experiments.log
+# Fine-tuning only: skip baseline, run Steps 2 & 3
+# Assumes baseline already trained under outputs/bicycle/splatfacto-colmap/
+# Run with: nohup bash scripts/run_finetune_only.sh > finetune.log 2>&1 &
 # ============================================================
 
 DATA=/mnt/hdd/data/bicycle
 RENDER_PATH=docs/assets/circle_path.json
 EDITED_IMAGES=images_snow       # base name; dataparser appends _8 -> images_snow_8
 DOWNSCALE=8
-BASELINE_ITERS=15000
 FINETUNE_ITERS=17000
-
-echo "============================================"
-echo "Starting experiments at $(date)"
-echo "============================================"
 
 # ----------------------------------------------------------
 # Symlink: the colmap dataparser with --downscale-factor 8
@@ -28,36 +23,22 @@ if [ ! -e "$DATA/images_snow_8" ]; then
   ln -s images_8_snow "$DATA/images_snow_8"
 fi
 
-# ----------------------------------------------------------
-# Step 1: Train baseline scene from scratch
-# ----------------------------------------------------------
-echo ""
-echo ">>> Step 1: Training baseline..."
-ns-train splatfacto-colmap \
-  --data "$DATA" \
-  --downscale-factor "$DOWNSCALE" \
-  --max-num-iterations "$BASELINE_ITERS" \
-  --vis tensorboard
-
-# Find the latest baseline output directory
+# Find the latest baseline checkpoint
 BASELINE_DIR=$(ls -td outputs/bicycle/splatfacto-colmap/*/ 2>/dev/null | head -1)
 if [ -z "$BASELINE_DIR" ]; then
-  echo "ERROR: Could not find baseline output directory"
+  echo "ERROR: No baseline found in outputs/bicycle/splatfacto-colmap/"
+  echo "Run the full experiment script first to train a baseline."
   exit 1
 fi
 CKPT_DIR="${BASELINE_DIR}nerfstudio_models"
 BASELINE_CONFIG="${BASELINE_DIR}config.yml"
-echo "Baseline saved to: $BASELINE_DIR"
+echo "Using baseline: $BASELINE_DIR"
 echo "Checkpoint dir: $CKPT_DIR"
 
-# Render baseline
 echo ""
-echo ">>> Rendering baseline..."
-mkdir -p renders
-ns-render camera-path \
-  --load-config "$BASELINE_CONFIG" \
-  --camera-path-filename "$RENDER_PATH" \
-  --output-path renders/bicycle_baseline.mp4
+echo "============================================"
+echo "Starting fine-tuning experiments at $(date)"
+echo "============================================"
 
 # ----------------------------------------------------------
 # Step 2: Normal single-view fine-tuning on edited images
@@ -79,6 +60,7 @@ ns-train splatfacto-gaussian-batch-colmap \
 
 NORMAL_CONFIG=$(ls -t outputs/bicycle/splatfacto-gaussian-batch-colmap/*/config.yml 2>/dev/null | head -1)
 echo ">>> Rendering normal fine-tuning..."
+mkdir -p renders
 ns-render camera-path \
   --load-config "$NORMAL_CONFIG" \
   --camera-path-filename "$RENDER_PATH" \
@@ -116,7 +98,7 @@ ns-render camera-path \
 # ----------------------------------------------------------
 echo ""
 echo "============================================"
-echo "All experiments completed at $(date)"
+echo "Fine-tuning experiments completed at $(date)"
 echo "============================================"
 echo ""
 echo "Renders saved in renders/:"
