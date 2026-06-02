@@ -531,17 +531,64 @@ class Trainer:
             for param, requires_grad in previous_requires_grad.items():
                 param.requires_grad_(requires_grad)
 
-    def _aggregate_gaussian_consensus_group(
+    def _new_gaussian_consensus_accumulator(self, param: torch.Tensor) -> Dict[str, torch.Tensor]:
+        num_gaussians = param.shape[0]
+        return {
+            "sum_grad": torch.zeros_like(param),
+            "visible_counts": torch.zeros(num_gaussians, device=param.device),
+            "sum_sq_norms": torch.zeros(num_gaussians, device=param.device),
+        }
+
+    @torch.no_grad()
+    def _update_gaussian_consensus_accumulator(
+        self,
+        param: torch.Tensor,
+        accumulator: Dict[str, torch.Tensor],
+        grad: Optional[torch.Tensor],
+        config,
+    ) -> None:
+        num_gaussians = param.shape[0]
+        if grad is None or num_gaussians == 0:
+            return
+
+        device = param.device
+        dtype = param.dtype
+        eps = config.gaussian_consensus_eps
+        max_views = config.gaussian_consensus_max_views_per_gaussian
+        chunk_size = max(1, config.gaussian_consensus_gaussian_chunk_size)
+
+        grad = grad.detach()
+        if grad.device != device or grad.dtype != dtype:
+            grad = grad.to(device=device, dtype=dtype, non_blocking=True)
+
+        sum_grad = accumulator["sum_grad"]
+        visible_counts = accumulator["visible_counts"]
+        sum_sq_norms = accumulator["sum_sq_norms"]
+
+        for start in range(0, num_gaussians, chunk_size):
+            end = min(start + chunk_size, num_gaussians)
+            grad_chunk = grad[start:end]
+            flat_grad = grad_chunk.reshape(end - start, -1)
+            grad_norms = flat_grad.norm(dim=-1).to(dtype=visible_counts.dtype)
+            visible = grad_norms > eps
+
+            if max_views > 0:
+                visible = visible & (visible_counts[start:end] < float(max_views))
+
+            visible_f = visible.to(dtype=visible_counts.dtype)
+            mask_shape = (end - start,) + (1,) * (grad_chunk.dim() - 1)
+            sum_grad[start:end].add_(grad_chunk * visible.to(dtype=dtype).reshape(mask_shape))
+            visible_counts[start:end].add_(visible_f)
+            sum_sq_norms[start:end].add_(grad_norms.square() * visible_f)
+
+    @torch.no_grad()
+    def _finalize_gaussian_consensus_group(
         self,
         group_name: str,
         param: torch.Tensor,
-        view_grads: List[torch.Tensor],
+        accumulator: Dict[str, torch.Tensor],
         config,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if len(view_grads) == 1:
-            grad = view_grads[0].to(device=param.device, dtype=param.dtype, non_blocking=True)
-            return grad, {}
-
         num_gaussians = param.shape[0]
         if num_gaussians == 0:
             return torch.zeros_like(param), {}
@@ -549,57 +596,49 @@ class Trainer:
         device = param.device
         dtype = param.dtype
         eps = config.gaussian_consensus_eps
-        max_views = config.gaussian_consensus_max_views_per_gaussian
         chunk_size = max(1, config.gaussian_consensus_gaussian_chunk_size)
         consensus_grad = torch.empty_like(param)
         visible_total = torch.zeros((), device=device)
         active_total = torch.zeros((), device=device)
         updated_total = torch.zeros((), device=device)
+        agreement_total = torch.zeros((), device=device)
+        agreement_count = torch.zeros((), device=device)
+
+        sum_grad = accumulator["sum_grad"]
+        visible_counts_all = accumulator["visible_counts"]
+        sum_sq_norms = accumulator["sum_sq_norms"]
 
         for start in range(0, num_gaussians, chunk_size):
             end = min(start + chunk_size, num_gaussians)
-            grads = torch.stack(
-                [grad[start:end].to(device=device, dtype=dtype, non_blocking=True) for grad in view_grads], dim=0
-            )
-            flat_grads = grads.reshape(grads.shape[0], grads.shape[1], -1)
-            grad_norms = flat_grads.norm(dim=-1)
-            visible = grad_norms > eps
-
-            if max_views > 0 and max_views < grads.shape[0]:
-                top_values, top_indices = grad_norms.topk(k=max_views, dim=0)
-                top_visible = torch.zeros_like(visible)
-                top_visible.scatter_(0, top_indices, top_values > eps)
-                visible = visible & top_visible
-
-            mean_weights = visible.to(dtype=flat_grads.dtype)
-            visible_counts = mean_weights.sum(dim=0)
-            mean_grad = (flat_grads * mean_weights[..., None]).sum(dim=0)
-            mean_grad = mean_grad / visible_counts.clamp_min(1.0)[..., None]
+            visible_counts = visible_counts_all[start:end]
+            mask_shape = (end - start,) + (1,) * (param.dim() - 1)
+            mean_grad = sum_grad[start:end] / visible_counts.clamp_min(1.0).to(dtype=dtype).reshape(mask_shape)
+            active = visible_counts > 0
 
             if config.gaussian_consensus_aggregator == "mean":
-                weights = mean_weights
+                weights = active.to(dtype=visible_counts.dtype)
             elif config.gaussian_consensus_aggregator == "cosine":
-                alignment = torch.nn.functional.cosine_similarity(
-                    flat_grads, mean_grad.unsqueeze(0), dim=-1, eps=eps
-                )
+                flat_mean_grad = mean_grad.reshape(end - start, -1)
+                mean_norm_sq = flat_mean_grad.norm(dim=-1).to(dtype=visible_counts.dtype).square()
+                expected_sq_norm = sum_sq_norms[start:end] / visible_counts.clamp_min(1.0)
+                agreement = mean_norm_sq.clamp_min(0.0).sqrt() / expected_sq_norm.clamp_min(eps).sqrt()
+                agreement = torch.where(active, agreement.clamp(max=1.0), torch.zeros_like(agreement))
                 weights = torch.where(
-                    alignment > config.gaussian_consensus_min_alignment,
-                    alignment,
-                    torch.zeros_like(alignment),
+                    agreement > config.gaussian_consensus_min_alignment,
+                    agreement,
+                    torch.zeros_like(agreement),
                 )
-                weights = weights * mean_weights
+                agreement_total += agreement[active].sum()
+                agreement_count += active.sum()
             else:
                 raise RuntimeError(f"Unknown Gaussian consensus aggregator: {config.gaussian_consensus_aggregator}")
 
-            weight_sum = weights.sum(dim=0)
-            aggregate = (flat_grads * weights[..., None]).sum(dim=0)
-            aggregate = aggregate / weight_sum.clamp_min(eps)[..., None]
-            aggregate = torch.where(weight_sum[..., None] > eps, aggregate, torch.zeros_like(aggregate))
-            consensus_grad[start:end].copy_(aggregate.reshape_as(grads[0]))
+            aggregate = mean_grad * weights.to(dtype=dtype).reshape(mask_shape)
+            consensus_grad[start:end].copy_(aggregate)
 
             visible_total += visible_counts.sum()
-            active_total += (visible_counts > 0).sum()
-            updated_total += (weight_sum > eps).sum()
+            active_total += active.sum()
+            updated_total += (weights > eps).sum()
 
         denom = torch.tensor(float(num_gaussians), device=device)
         stats = {
@@ -607,6 +646,8 @@ class Trainer:
             f"Consensus/{group_name}_active_fraction": active_total / denom,
             f"Consensus/{group_name}_updated_fraction": updated_total / denom,
         }
+        if config.gaussian_consensus_aggregator == "cosine":
+            stats[f"Consensus/{group_name}_avg_agreement"] = agreement_total / agreement_count.clamp_min(1.0)
         return consensus_grad, stats
 
     def _mean_logged_dicts(self, dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -665,7 +706,10 @@ class Trainer:
             raise RuntimeError("gaussian_consensus_num_views must be at least 1.")
 
         trainable_groups = self._get_gaussian_consensus_param_groups()
-        view_grads: Dict[str, List[torch.Tensor]] = {group: [] for group in trainable_groups}
+        consensus_accumulators = {
+            group: self._new_gaussian_consensus_accumulator(self.optimizers.parameters[group][0])
+            for group in trainable_groups
+        }
         loss_dicts: List[Dict[str, torch.Tensor]] = []
         metrics_dicts: List[Dict[str, torch.Tensor]] = []
         losses: List[torch.Tensor] = []
@@ -684,14 +728,9 @@ class Trainer:
                 self.grad_scaler.scale(loss).backward()  # type: ignore
                 for group in trainable_groups:
                     param = self.optimizers.parameters[group][0]
-                    grad = param.grad
-                    if grad is None:
-                        grad_for_view = torch.zeros(param.shape, dtype=param.dtype, device="cpu")
-                    else:
-                        grad_for_view = grad.detach().clone()
-                        if config.gaussian_consensus_store_grads_on_cpu:
-                            grad_for_view = grad_for_view.cpu()
-                    view_grads[group].append(grad_for_view)
+                    self._update_gaussian_consensus_accumulator(
+                        param, consensus_accumulators[group], param.grad, config
+                    )
 
                 loss_dicts.append({key: value.detach() for key, value in loss_dict.items()})
                 metrics_dicts.append(metrics_dict)
@@ -702,7 +741,9 @@ class Trainer:
         consensus_stats: Dict[str, torch.Tensor] = {}
         for group in trainable_groups:
             param = self.optimizers.parameters[group][0]
-            consensus_grad, stats = self._aggregate_gaussian_consensus_group(group, param, view_grads[group], config)
+            consensus_grad, stats = self._finalize_gaussian_consensus_group(
+                group, param, consensus_accumulators[group], config
+            )
             param.grad = consensus_grad
             consensus_stats.update(stats)
 

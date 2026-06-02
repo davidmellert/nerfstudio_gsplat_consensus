@@ -189,7 +189,7 @@ class SplatfactoModelConfig(ModelConfig):
     gaussian_consensus_disable_refinement: bool = True
     """If True, disable gsplat densification/culling/reset callbacks during consensus optimization."""
     gaussian_consensus_store_grads_on_cpu: bool = True
-    """If True, store per-view gradients on CPU and aggregate them in chunks to reduce VRAM use."""
+    """Deprecated compatibility flag; consensus gradients are now aggregated online on device."""
     gaussian_consensus_gaussian_chunk_size: int = 65536
     """Number of Gaussians to aggregate at once for each optimizer group."""
     gaussian_consensus_eps: float = 1e-8
