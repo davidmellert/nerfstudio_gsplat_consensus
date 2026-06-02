@@ -194,6 +194,10 @@ class SplatfactoModelConfig(ModelConfig):
     """Number of Gaussians to aggregate at once for each optimizer group."""
     gaussian_consensus_eps: float = 1e-8
     """Small value used for consensus visibility and normalization checks."""
+    dc_regularization_enabled: bool = False
+    """If True, add L2 regularization anchoring features_dc to their pre-finetuning values."""
+    dc_regularization_weight: float = 0.01
+    """Weight (lambda) for the DC regularization loss term."""
 
 
 class SplatfactoModel(Model):
@@ -741,6 +745,13 @@ class SplatfactoModel(Model):
             self.camera_optimizer.get_loss_dict(loss_dict)
             if self.config.use_bilateral_grid:
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+
+        # DC regularization: penalize drift from pre-finetuning features_dc
+        if self.config.dc_regularization_enabled and hasattr(self, "_original_features_dc"):
+            dc_reg = self.config.dc_regularization_weight * (
+                (self.gauss_params["features_dc"] - self._original_features_dc) ** 2
+            ).mean()
+            loss_dict["dc_regularization"] = dc_reg
 
         return loss_dict
 

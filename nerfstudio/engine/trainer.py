@@ -206,6 +206,7 @@ class Trainer:
         self._check_viewer_warnings()
 
         self._load_checkpoint()
+        self._save_dc_regularization_anchor()
 
         self.callbacks = self.pipeline.get_training_callbacks(
             TrainingCallbackAttributes(
@@ -493,6 +494,15 @@ class Trainer:
             for f in self.checkpoint_dir.glob("*.ckpt"):
                 if f != ckpt_path:
                     f.unlink()
+
+    def _save_dc_regularization_anchor(self) -> None:
+        """Snapshot features_dc before fine-tuning so the DC regularizer has an anchor."""
+        model_config = getattr(self.pipeline.model, "config", None)
+        if model_config is not None and getattr(model_config, "dc_regularization_enabled", False):
+            gauss_params = getattr(self.pipeline.model, "gauss_params", None)
+            if gauss_params is not None and "features_dc" in gauss_params:
+                self.pipeline.model._original_features_dc = gauss_params["features_dc"].detach().clone()
+                CONSOLE.log("[bold green]Saved features_dc anchor for DC regularization.")
 
     def _get_gaussian_consensus_config(self):
         model_config = getattr(self.pipeline.model, "config", None)
