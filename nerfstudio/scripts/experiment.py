@@ -294,6 +294,32 @@ def _apply_consensus(config: TrainerConfig, run_spec: Mapping[str, Any]) -> None
         if source_name in consensus:
             setattr(model_config, target_name, consensus[source_name])
 
+    visualization = consensus.get("visualization", {}) or {}
+    if not isinstance(visualization, Mapping):
+        raise ValueError("consensus.visualization must be a mapping")
+    for source_name, target_name in (
+        ("enabled", "gaussian_consensus_visualization_enabled"),
+        ("interval", "gaussian_consensus_visualization_interval"),
+        ("window", "gaussian_consensus_visualization_window"),
+        ("capture_window", "gaussian_consensus_visualization_window"),
+        ("output_dir", "gaussian_consensus_visualization_output_dir"),
+        ("save_png", "gaussian_consensus_visualization_save_png"),
+        ("save_npz", "gaussian_consensus_visualization_save_npz"),
+        ("save_per_gaussian", "gaussian_consensus_visualization_save_per_gaussian"),
+    ):
+        if source_name in visualization:
+            setattr(model_config, target_name, visualization[source_name])
+    if "save_raw" in visualization and "save_npz" not in visualization:
+        model_config.gaussian_consensus_visualization_save_npz = bool(visualization["save_raw"])
+    if "groups" in visualization:
+        visualization_groups = visualization["groups"]
+        if visualization_groups in (None, "") or visualization_groups == []:
+            model_config.gaussian_consensus_visualization_groups = ()
+        else:
+            groups_for_visualization = _normalize_trainable_groups(visualization_groups)
+            assert groups_for_visualization is not None
+            model_config.gaussian_consensus_visualization_groups = groups_for_visualization
+
     densification = consensus.get("densification", consensus.get("densify", False))
     trainable = consensus.get("trainable", consensus.get("trainable_params", run_spec.get("trainable")))
     groups = _normalize_trainable_groups(trainable)

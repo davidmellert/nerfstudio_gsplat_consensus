@@ -210,6 +210,25 @@ class SplatfactoModelConfig(ModelConfig):
 
     Empty uses consensus groups or all Gaussian groups.
     """
+    gaussian_consensus_visualization_enabled: bool = False
+    """If True, save offline Gaussian consensus visualization snapshots during training."""
+    gaussian_consensus_visualization_interval: int = 500
+    """Number of training steps between offline consensus visualization snapshot windows."""
+    gaussian_consensus_visualization_window: int = 1
+    """Number of consecutive training steps captured at each visualization interval boundary."""
+    gaussian_consensus_visualization_output_dir: str = "consensus_visualizations"
+    """Directory, relative to the run output folder, where consensus visualization snapshots are saved."""
+    gaussian_consensus_visualization_groups: Tuple[str, ...] = ()
+    """Gaussian parameter groups included in offline consensus visualization snapshots.
+
+    Empty uses the consensus trainable groups.
+    """
+    gaussian_consensus_visualization_save_png: bool = True
+    """If True, save rendered PNG panels for offline consensus visualization snapshots."""
+    gaussian_consensus_visualization_save_npz: bool = True
+    """If True, save compact raw arrays for the standalone Streamlit visualization app."""
+    gaussian_consensus_visualization_save_per_gaussian: bool = False
+    """Reserved debug flag for saving heavier per-Gaussian diagnostic payloads."""
 
 
 class SplatfactoModel(Model):
@@ -657,6 +676,135 @@ class SplatfactoModel(Model):
         if len(cached_values) > 0:
             self._cache_gradient_visualization_values(cached_values)
         return cached_values
+
+    @torch.no_grad()
+    def _render_gaussian_attribute_maps(
+        self,
+        means: torch.Tensor,
+        quats: torch.Tensor,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+        viewmat: torch.Tensor,
+        K: torch.Tensor,
+        W: int,
+        H: int,
+        scalar_attributes: Dict[str, torch.Tensor],
+        rgb_attributes: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        rendered_outputs: Dict[str, torch.Tensor] = {}
+        if means.shape[0] == 0:
+            return rendered_outputs
+
+        eps = self.config.gaussian_consensus_eps
+
+        def rasterize_colors(colors: torch.Tensor) -> torch.Tensor:
+            render, alpha, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+                means=means,
+                quats=quats,
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(opacities).squeeze(-1),
+                colors=colors,
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=None,
+                sparse_grad=False,
+                absgrad=False,
+                rasterize_mode=self.config.rasterize_mode,
+            )
+            return torch.where(
+                alpha > eps,
+                render / alpha.clamp_min(eps),
+                torch.zeros_like(render),
+            ).squeeze(0)
+
+        scalar_items: List[Tuple[str, torch.Tensor]] = []
+        for name, value in scalar_attributes.items():
+            value = value.detach().to(device=means.device, dtype=means.dtype).reshape(-1)
+            if value.shape[0] == means.shape[0]:
+                scalar_items.append((name, value))
+
+        for start in range(0, len(scalar_items), 3):
+            chunk = scalar_items[start : start + 3]
+            colors = means.new_zeros((means.shape[0], 3))
+            for channel, (_, value) in enumerate(chunk):
+                colors[:, channel] = value
+            rendered = rasterize_colors(colors)
+            for channel, (name, _) in enumerate(chunk):
+                rendered_outputs[name] = rendered[..., channel : channel + 1]
+
+        for name, value in rgb_attributes.items():
+            value = value.detach().to(device=means.device, dtype=means.dtype).reshape(means.shape[0], -1)
+            if value.shape[-1] != 3:
+                continue
+            rendered_outputs[name] = rasterize_colors(value[:, :3])
+
+        return rendered_outputs
+
+    @torch.no_grad()
+    def render_gaussian_attribute_maps_for_camera(
+        self,
+        camera: Cameras,
+        scalar_attributes: Dict[str, torch.Tensor],
+        rgb_attributes: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Render arbitrary per-Gaussian attributes into one camera for offline diagnostics."""
+        if not isinstance(camera, Cameras) or self.num_points == 0:
+            return {}
+
+        if self.training:
+            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
+        else:
+            optimized_camera_to_world = camera.camera_to_worlds
+
+        if self.crop_box is not None and not self.training:
+            crop_ids = self.crop_box.within(self.means).squeeze()
+            if crop_ids.sum() == 0:
+                return {}
+        else:
+            crop_ids = None
+
+        if crop_ids is not None:
+            means = self.means[crop_ids]
+            quats = self.quats[crop_ids]
+            scales = self.scales[crop_ids]
+            opacities = self.opacities[crop_ids]
+            scalar_attributes = {
+                name: value[crop_ids] for name, value in scalar_attributes.items() if value.shape[0] == self.num_points
+            }
+            rgb_attributes = {
+                name: value[crop_ids] for name, value in rgb_attributes.items() if value.shape[0] == self.num_points
+            }
+        else:
+            means = self.means
+            quats = self.quats
+            scales = self.scales
+            opacities = self.opacities
+
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        K = camera.get_intrinsics_matrices().to(self.device)
+        W, H = int(camera.width.item()), int(camera.height.item())
+        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+
+        return self._render_gaussian_attribute_maps(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            viewmat=viewmat,
+            K=K,
+            W=W,
+            H=H,
+            scalar_attributes=scalar_attributes,
+            rgb_attributes=rgb_attributes,
+        )
 
     @torch.no_grad()
     def _render_gradient_visualization_outputs(

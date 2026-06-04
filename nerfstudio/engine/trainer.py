@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
 import os
 import time
 from collections import defaultdict
@@ -27,10 +28,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
+from typing import Any, DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
 
+import mediapy as media
+import numpy as np
 import torch
 import viser
+from PIL import Image, ImageDraw
 from rich import box, style
 from rich.panel import Panel
 from rich.table import Table
@@ -40,7 +44,8 @@ from nerfstudio.configs.experiment_config import ExperimentConfig
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
-from nerfstudio.utils import profiler, writer
+from nerfstudio.utils import colormaps, profiler, writer
+from nerfstudio.utils.consensus_visualization import compute_consensus_visualization_data
 from nerfstudio.utils.decorators import check_eval_enabled, check_main_thread, check_viewer_enabled
 from nerfstudio.utils.misc import step_check
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -549,6 +554,518 @@ class Trainer:
             for param, requires_grad in previous_requires_grad.items():
                 param.requires_grad_(requires_grad)
 
+    def _get_gaussian_consensus_visualization_groups(self, trainable_groups: List[str], config) -> List[str]:
+        groups = list(getattr(config, "gaussian_consensus_visualization_groups", ()))
+        if len(groups) == 0:
+            groups = list(trainable_groups)
+        missing = [group for group in groups if group not in trainable_groups]
+        if missing:
+            raise RuntimeError(
+                "Consensus visualization groups must be trainable consensus groups. "
+                f"Missing from trainable groups: {missing}"
+            )
+        return groups
+
+    def _get_gaussian_consensus_visualization_window_start(self, step: int, config) -> int:
+        interval = int(getattr(config, "gaussian_consensus_visualization_interval", 0))
+        if interval <= 0:
+            return step
+        return (step // interval) * interval
+
+    def _should_capture_gaussian_consensus_visualization(self, step: int, config) -> bool:
+        if not bool(getattr(config, "gaussian_consensus_visualization_enabled", False)):
+            return False
+        interval = int(getattr(config, "gaussian_consensus_visualization_interval", 0))
+        window = max(1, int(getattr(config, "gaussian_consensus_visualization_window", 1)))
+        return interval > 0 and step % interval < window
+
+    def _clone_gaussian_consensus_visualization_grad(self, param: torch.Tensor, grad: Optional[torch.Tensor], config):
+        if grad is None:
+            return torch.zeros(param.shape, dtype=param.dtype, device="cpu")
+        grad_for_view = grad.detach().clone()
+        if getattr(config, "gaussian_consensus_store_grads_on_cpu", True):
+            grad_for_view = grad_for_view.cpu()
+        return grad_for_view
+
+    def _get_consensus_view_cam_idx(self, camera: Any, batch: Dict[str, Any]) -> Optional[int]:
+        metadata = getattr(camera, "metadata", None)
+        value = None
+        if isinstance(metadata, dict) and "cam_idx" in metadata:
+            value = metadata["cam_idx"]
+        elif "image_idx" in batch:
+            value = batch["image_idx"]
+        if isinstance(value, torch.Tensor):
+            value = value.detach().flatten()[0].cpu().item()
+        if value is None:
+            return None
+        return int(value)
+
+    def _capture_gaussian_consensus_view_record(self, camera: Any, batch: Dict[str, Any]) -> Dict[str, Any]:
+        image = batch.get("image")
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu()
+        return {
+            "camera": camera,
+            "image": image,
+            "cam_idx": self._get_consensus_view_cam_idx(camera, batch),
+        }
+
+    @staticmethod
+    def _image_tensor_to_numpy(image: Any) -> np.ndarray:
+        if isinstance(image, torch.Tensor):
+            tensor = image.detach().cpu()
+            array = tensor.float().numpy()
+            integer_image = not tensor.dtype.is_floating_point
+        else:
+            raw_array = np.asarray(image)
+            integer_image = np.issubdtype(raw_array.dtype, np.integer)
+            array = raw_array.astype(np.float32)
+        if array.ndim == 2:
+            array = array[..., None]
+        if array.shape[-1] == 1:
+            array = np.repeat(array, 3, axis=-1)
+        if array.shape[-1] > 3:
+            array = array[..., :3]
+        finite = array[np.isfinite(array)]
+        if integer_image or (finite.size > 0 and float(np.max(finite)) > 1.5):
+            array = array / 255.0
+        return np.clip(array, 0.0, 1.0)
+
+    @staticmethod
+    def _float_image_to_uint8(image: np.ndarray) -> np.ndarray:
+        image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+        return (np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    @staticmethod
+    def _signed_array_to_rgb(array: np.ndarray, scale: Optional[float] = None) -> np.ndarray:
+        array = np.nan_to_num(array.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if scale is None:
+            scale = float(np.percentile(np.abs(array), 99.0)) if array.size > 0 else 0.0
+            if scale <= 0.0:
+                scale = float(np.max(np.abs(array))) if array.size > 0 else 1.0
+        scale = max(scale, 1e-8)
+        if array.ndim == 2 or array.shape[-1] == 1:
+            scalar = np.squeeze(array, axis=-1) if array.ndim == 3 else array
+            signed = np.clip(scalar / scale, -1.0, 1.0)
+            magnitude = np.abs(signed)
+            return np.stack(
+                [
+                    np.where(signed > 0, magnitude, 0.0),
+                    1.0 - magnitude,
+                    np.where(signed < 0, magnitude, 0.0),
+                ],
+                axis=-1,
+            )
+        return np.clip(array / (2.0 * scale) + 0.5, 0.0, 1.0)
+
+    @staticmethod
+    def _tensor_finite_max(value: torch.Tensor) -> float:
+        value = value.detach().float()
+        finite = value[torch.isfinite(value)]
+        if finite.numel() == 0:
+            return 0.0
+        return float(finite.max().cpu().item())
+
+    @staticmethod
+    def _tensor_finite_abs_max(value: torch.Tensor) -> float:
+        value = value.detach().float()
+        finite = value[torch.isfinite(value)]
+        if finite.numel() == 0:
+            return 0.0
+        return float(finite.abs().max().cpu().item())
+
+    @staticmethod
+    def _is_update_norm_map(name: str) -> bool:
+        return name.startswith("view_update_norm_") or name in {"mean_update_norm", "final_update_norm"}
+
+    @staticmethod
+    def _scale_record(kind: str, min_value: float, max_value: float) -> Dict[str, Any]:
+        return {"kind": kind, "min": float(min_value), "max": float(max_value)}
+
+    @staticmethod
+    def _scalar_tensor_to_panel_image(
+        name: str,
+        value: torch.Tensor,
+        value_range: Optional[Tuple[float, float]] = None,
+        signed_scale: Optional[float] = None,
+    ) -> np.ndarray:
+        value = value.detach().cpu().float()
+        if value.ndim == 2:
+            value = value[..., None]
+        if "opacity_update" in name:
+            return Trainer._signed_array_to_rgb(value.numpy(), scale=signed_scale)
+        normalize = name not in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}
+        if value_range is not None:
+            min_value, max_value = value_range
+            denominator = max(float(max_value) - float(min_value), 1e-8)
+            value = torch.nan_to_num(value, nan=0.0, posinf=float(max_value), neginf=float(min_value))
+            value = torch.clamp((value - float(min_value)) / denominator, 0.0, 1.0)
+            normalize = False
+        options = colormaps.ColormapOptions(colormap="turbo", normalize=normalize)
+        return colormaps.apply_colormap(value, colormap_options=options).cpu().numpy()
+
+    @staticmethod
+    def _rgb_tensor_to_panel_image(name: str, value: torch.Tensor, signed_scale: Optional[float] = None) -> np.ndarray:
+        array = value.detach().cpu().float().numpy()
+        if "update" in name:
+            return Trainer._signed_array_to_rgb(array, scale=signed_scale)
+        return np.clip(array, 0.0, 1.0)
+
+    @staticmethod
+    def _write_png(path: Path, image: np.ndarray) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        media.write_image(path, Trainer._float_image_to_uint8(image), fmt="png")
+
+    @staticmethod
+    def _labeled_image(label: str, image: np.ndarray) -> Image.Image:
+        array = Trainer._float_image_to_uint8(image)
+        pil_image = Image.fromarray(array)
+        label_height = 24
+        canvas = Image.new("RGB", (pil_image.width, pil_image.height + label_height), color=(18, 18, 18))
+        canvas.paste(pil_image, (0, label_height))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((6, 5), label, fill=(240, 240, 240))
+        return canvas
+
+    @staticmethod
+    def _write_dashboard(path: Path, rows: List[List[Tuple[str, np.ndarray]]]) -> None:
+        labeled_rows: List[Image.Image] = []
+        for row in rows:
+            cells = [Trainer._labeled_image(label, image) for label, image in row]
+            if len(cells) == 0:
+                continue
+            width = sum(cell.width for cell in cells)
+            height = max(cell.height for cell in cells)
+            row_image = Image.new("RGB", (width, height), color=(18, 18, 18))
+            x_offset = 0
+            for cell in cells:
+                row_image.paste(cell, (x_offset, 0))
+                x_offset += cell.width
+            labeled_rows.append(row_image)
+        if len(labeled_rows) == 0:
+            return
+        width = max(row.width for row in labeled_rows)
+        height = sum(row.height for row in labeled_rows)
+        dashboard = Image.new("RGB", (width, height), color=(18, 18, 18))
+        y_offset = 0
+        for row in labeled_rows:
+            dashboard.paste(row, (0, y_offset))
+            y_offset += row.height
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dashboard.save(path)
+
+    @staticmethod
+    def _read_png_float(path: Path) -> Optional[np.ndarray]:
+        if not path.exists():
+            return None
+        return np.asarray(Image.open(path).convert("RGB")).astype(np.float32) / 255.0
+
+    @staticmethod
+    def _write_gaussian_consensus_preview_dashboard(step_dir: Path, manifest: Dict[str, Any]) -> None:
+        panels = manifest.get("panels", {})
+        if not panels:
+            return
+
+        def get_panel(name: str) -> Optional[np.ndarray]:
+            relative_path = panels.get(name)
+            if relative_path is None:
+                return None
+            return Trainer._read_png_float(step_dir / relative_path)
+
+        input_row: List[Tuple[str, np.ndarray]] = []
+        cam_indices = manifest.get("cam_indices", [])
+        num_views = int(manifest.get("num_views", 0))
+        for view_idx in range(num_views):
+            name = "input_anchor" if view_idx == 0 else f"input_ref_{view_idx:02d}"
+            image = get_panel(name)
+            if image is None:
+                continue
+            label = "anchor" if view_idx == 0 else f"ref {view_idx}"
+            cam_idx = cam_indices[view_idx] if view_idx < len(cam_indices) else None
+            if cam_idx is not None:
+                label = f"{label} ({cam_idx})"
+            input_row.append((label, image))
+
+        norm_row: List[Tuple[str, np.ndarray]] = []
+        for view_idx in range(num_views):
+            name = f"view_update_norm_{view_idx:02d}"
+            image = get_panel(name)
+            if image is not None:
+                norm_row.append((f"view {view_idx}", image))
+        for label, name in (("mean", "mean_update_norm"), ("final", "final_update_norm")):
+            image = get_panel(name)
+            if image is not None:
+                norm_row.append((label, image))
+
+        agreement_row: List[Tuple[str, np.ndarray]] = []
+        for label, name in (
+            ("visible views", "visible_view_count"),
+            ("agreement", "agreement"),
+            ("disagreement", "disagreement"),
+            ("dominant", "dominant_view"),
+            ("dominance", "dominance_strength"),
+            ("suppression", "suppression_ratio"),
+        ):
+            image = get_panel(name)
+            if image is not None:
+                agreement_row.append((label, image))
+
+        direction_row: List[Tuple[str, np.ndarray]] = []
+        for label, name in (
+            ("rgb before", "current_rgb"),
+            ("rgb after", "target_rgb_after_step"),
+            ("rgb mean", "rgb_update_mean"),
+            ("rgb final", "rgb_update_final"),
+            ("opacity mean", "opacity_update_mean"),
+            ("opacity final", "opacity_update_final"),
+        ):
+            image = get_panel(name)
+            if image is not None:
+                direction_row.append((label, image))
+
+        dashboard_rows = [row for row in (input_row, norm_row, agreement_row, direction_row) if len(row) > 0]
+        Trainer._write_dashboard(step_dir / "preview_dashboard.png", dashboard_rows)
+
+    @staticmethod
+    def _tensor_to_npz_array(value: torch.Tensor) -> np.ndarray:
+        array = value.detach().cpu().numpy()
+        if array.dtype.kind == "f":
+            return array.astype(np.float32)
+        return array
+
+    def _render_current_rgb_for_consensus_visualization(self, camera: Any) -> Optional[np.ndarray]:
+        model = self.pipeline.model
+        was_training = model.training
+        try:
+            model.eval()
+            with torch.no_grad():
+                outputs = model.get_outputs_for_camera(camera)
+            rgb = outputs.get("rgb")
+            if isinstance(rgb, torch.Tensor):
+                return self._image_tensor_to_numpy(rgb)
+        finally:
+            if was_training:
+                model.train()
+        return None
+
+    def _write_gaussian_consensus_visualization_snapshot(
+        self,
+        step: int,
+        config,
+        groups: List[str],
+        view_records: List[Dict[str, Any]],
+        view_grads: Dict[str, List[torch.Tensor]],
+        final_grads: Dict[str, torch.Tensor],
+    ) -> None:
+        if len(view_records) == 0 or len(groups) == 0:
+            return
+        learning_rates = {group: self.pipeline.model._get_optimizer_lr(group) for group in groups}
+        per_gaussian, scalar_attributes, rgb_attributes = compute_consensus_visualization_data(
+            {group: view_grads[group] for group in groups if group in view_grads},
+            {group: final_grads[group] for group in groups if group in final_grads},
+            learning_rates=learning_rates,
+            eps=float(config.gaussian_consensus_eps),
+            max_views=int(config.gaussian_consensus_max_views_per_gaussian),
+        )
+        if len(per_gaussian) == 0:
+            return
+
+        anchor_camera = view_records[0]["camera"]
+        rendered_maps = self.pipeline.model.render_gaussian_attribute_maps_for_camera(
+            anchor_camera, scalar_attributes=scalar_attributes, rgb_attributes=rgb_attributes
+        )
+
+        output_root = self.base_dir / str(getattr(config, "gaussian_consensus_visualization_output_dir", "consensus_visualizations"))
+        step_dir = output_root / f"step_{step:09d}"
+        panels: Dict[str, str] = {}
+        npz_arrays: Dict[str, np.ndarray] = {}
+
+        cam_indices = [record.get("cam_idx") for record in view_records]
+        interval = int(getattr(config, "gaussian_consensus_visualization_interval", 0))
+        window_size = max(1, int(getattr(config, "gaussian_consensus_visualization_window", 1)))
+        window_start = self._get_gaussian_consensus_visualization_window_start(step, config)
+        for view_idx, record in enumerate(view_records):
+            image = record.get("image")
+            if image is None:
+                continue
+            name = "input_anchor" if view_idx == 0 else f"input_ref_{view_idx:02d}"
+            image_np = self._image_tensor_to_numpy(image)
+            npz_arrays[f"input__{name}"] = image_np.astype(np.float32)
+            if bool(getattr(config, "gaussian_consensus_visualization_save_png", True)):
+                panels[name] = f"panels/{name}.png"
+                self._write_png(step_dir / panels[name], image_np)
+
+        panel_scales: Dict[str, Dict[str, Any]] = {}
+        norm_scale_values = [
+            self._tensor_finite_max(value)
+            for name, value in rendered_maps.items()
+            if self._is_update_norm_map(name)
+        ]
+        norm_scale_max = max(norm_scale_values, default=0.0)
+        norm_scale_max = max(norm_scale_max, 1e-8)
+        rgb_signed_scale = max(
+            (self._tensor_finite_abs_max(value) for name, value in rendered_maps.items() if "rgb_update" in name),
+            default=0.0,
+        )
+        rgb_signed_scale = max(rgb_signed_scale, 1e-8)
+        opacity_signed_scale = max(
+            (self._tensor_finite_abs_max(value) for name, value in rendered_maps.items() if "opacity_update" in name),
+            default=0.0,
+        )
+        opacity_signed_scale = max(opacity_signed_scale, 1e-8)
+        max_view_index = max(1, len(view_records) - 1)
+        max_visible_count = max(1, len(view_records))
+
+        for name, value in rendered_maps.items():
+            npz_arrays[f"map__{name}"] = self._tensor_to_npz_array(value)
+            scalar_range: Optional[Tuple[float, float]] = None
+            signed_scale: Optional[float] = None
+            if self._is_update_norm_map(name):
+                scalar_range = (0.0, norm_scale_max)
+                panel_scales[name] = self._scale_record("linear", 0.0, norm_scale_max)
+            elif name in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}:
+                scalar_range = (0.0, 1.0)
+                panel_scales[name] = self._scale_record("linear", 0.0, 1.0)
+            elif name == "visible_view_count":
+                scalar_range = (0.0, float(max_visible_count))
+                panel_scales[name] = self._scale_record("count", 0.0, float(max_visible_count))
+            elif name == "dominant_view":
+                scalar_range = (0.0, float(max_view_index))
+                panel_scales[name] = self._scale_record("categorical", 0.0, float(max_view_index))
+            elif "opacity_update" in name:
+                signed_scale = opacity_signed_scale
+                panel_scales[name] = self._scale_record("signed", -opacity_signed_scale, opacity_signed_scale)
+
+            if value.shape[-1] == 1:
+                panel_image = self._scalar_tensor_to_panel_image(
+                    name, value, value_range=scalar_range, signed_scale=signed_scale
+                )
+            else:
+                if "rgb_update" in name:
+                    signed_scale = rgb_signed_scale
+                    panel_scales[name] = self._scale_record("signed", -rgb_signed_scale, rgb_signed_scale)
+                panel_image = self._rgb_tensor_to_panel_image(name, value, signed_scale=signed_scale)
+            if bool(getattr(config, "gaussian_consensus_visualization_save_png", True)):
+                panels[name] = f"panels/{name}.png"
+                self._write_png(step_dir / panels[name], panel_image)
+
+        current_rgb = self._render_current_rgb_for_consensus_visualization(anchor_camera)
+        if current_rgb is not None:
+            npz_arrays["map__current_rgb"] = current_rgb.astype(np.float32)
+            panel_scales["current_rgb"] = self._scale_record("rgb", 0.0, 1.0)
+            if bool(getattr(config, "gaussian_consensus_visualization_save_png", True)):
+                panels["current_rgb"] = "panels/current_rgb.png"
+                self._write_png(step_dir / panels["current_rgb"], current_rgb)
+
+        for name, value in per_gaussian.items():
+            npz_arrays[f"gaussian__{name}"] = self._tensor_to_npz_array(value)
+        npz_arrays["view_cam_indices"] = np.asarray([-1 if idx is None else int(idx) for idx in cam_indices], dtype=np.int64)
+
+        summary = {
+            name: float(torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0).mean().cpu().item())
+            for name, value in per_gaussian.items()
+            if value.is_floating_point() and value.ndim <= 2
+        }
+        manifest = {
+            "version": 1,
+            "step": step,
+            "groups": groups,
+            "num_views": len(view_records),
+            "cam_indices": cam_indices,
+            "capture_window": {
+                "start": window_start,
+                "end": window_start + window_size - 1,
+                "size": window_size,
+                "interval": interval,
+            },
+            "window_start": window_start,
+            "learning_rates": learning_rates,
+            "summary": summary,
+            "snapshot_file": "snapshot.npz" if bool(getattr(config, "gaussian_consensus_visualization_save_npz", True)) else None,
+            "panel_scales": panel_scales,
+            "panels": panels,
+        }
+
+        step_dir.mkdir(parents=True, exist_ok=True)
+        if bool(getattr(config, "gaussian_consensus_visualization_save_npz", True)):
+            np.savez_compressed(step_dir / "snapshot.npz", **npz_arrays)
+
+        if bool(getattr(config, "gaussian_consensus_visualization_save_png", True)):
+            self._write_gaussian_consensus_preview_dashboard(step_dir, manifest)
+            manifest["preview_dashboard"] = "preview_dashboard.png"
+
+        (step_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        index_path = output_root / "index.json"
+        if index_path.exists():
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        else:
+            index = {"version": 1, "captures": []}
+        captures = [capture for capture in index.get("captures", []) if int(capture.get("step", -1)) != step]
+        captures.append(
+            {
+                "step": step,
+                "path": step_dir.name,
+                "cam_indices": cam_indices,
+                "window_start": window_start,
+                "window_end": window_start + window_size - 1,
+                "summary": summary,
+            }
+        )
+        captures.sort(key=lambda capture: int(capture.get("step", 0)))
+        index["captures"] = captures
+        index["interval"] = interval
+        index["window_size"] = window_size
+        output_root.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+
+    def _append_gaussian_consensus_visualization_post_step_rgb(
+        self,
+        step: int,
+        config,
+        view_records: List[Dict[str, Any]],
+    ) -> None:
+        if len(view_records) == 0:
+            return
+        save_png = bool(getattr(config, "gaussian_consensus_visualization_save_png", True))
+        save_npz = bool(getattr(config, "gaussian_consensus_visualization_save_npz", True))
+        if not save_png and not save_npz:
+            return
+
+        output_root = self.base_dir / str(getattr(config, "gaussian_consensus_visualization_output_dir", "consensus_visualizations"))
+        step_dir = output_root / f"step_{step:09d}"
+        manifest_path = step_dir / "manifest.json"
+        if not manifest_path.exists():
+            return
+
+        post_step_rgb = self._render_current_rgb_for_consensus_visualization(view_records[0]["camera"])
+        if post_step_rgb is None:
+            return
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        panels = manifest.setdefault("panels", {})
+        panel_scales = manifest.setdefault("panel_scales", {})
+        panel_name = "target_rgb_after_step"
+
+        if save_png:
+            panels[panel_name] = f"panels/{panel_name}.png"
+            self._write_png(step_dir / panels[panel_name], post_step_rgb)
+
+        snapshot_file = manifest.get("snapshot_file")
+        if save_npz and snapshot_file:
+            snapshot_path = step_dir / snapshot_file
+            npz_arrays: Dict[str, np.ndarray] = {}
+            if snapshot_path.exists():
+                with np.load(snapshot_path, allow_pickle=False) as snapshot:
+                    npz_arrays = {key: snapshot[key] for key in snapshot.files}
+            npz_arrays[f"map__{panel_name}"] = post_step_rgb.astype(np.float32)
+            np.savez_compressed(snapshot_path, **npz_arrays)
+
+        panel_scales[panel_name] = self._scale_record("rgb", 0.0, 1.0)
+        if save_png:
+            self._write_gaussian_consensus_preview_dashboard(step_dir, manifest)
+            manifest["preview_dashboard"] = "preview_dashboard.png"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
     def _new_gaussian_consensus_accumulator(self, param: torch.Tensor) -> Dict[str, torch.Tensor]:
         num_gaussians = param.shape[0]
         return {
@@ -803,6 +1320,10 @@ class Trainer:
             raise RuntimeError("gaussian_consensus_num_views must be at least 1.")
 
         trainable_groups = self._get_gaussian_consensus_param_groups()
+        capture_visualization = self._should_capture_gaussian_consensus_visualization(step, config)
+        visualization_groups = (
+            self._get_gaussian_consensus_visualization_groups(trainable_groups, config) if capture_visualization else []
+        )
         refine_consensus = not config.gaussian_consensus_disable_refinement
         if refine_consensus:
             required_groups = {"means", "scales", "quats", "features_dc", "features_rest", "opacities"}
@@ -825,6 +1346,9 @@ class Trainer:
         else:
             consensus_accumulators = {}
             view_grads = {group: [] for group in trainable_groups}
+        visualization_view_grads = {group: [] for group in visualization_groups}
+        visualization_view_records: List[Dict[str, Any]] = []
+        visualization_final_grads: Dict[str, torch.Tensor] = {}
         loss_dicts: List[Dict[str, torch.Tensor]] = []
         metrics_dicts: List[Dict[str, torch.Tensor]] = []
         losses: List[torch.Tensor] = []
@@ -834,6 +1358,8 @@ class Trainer:
         self.optimizers.zero_grad_all()
         with self._only_consensus_groups_require_grad(trainable_groups):
             for ray_bundle, batch in self._iter_gaussian_consensus_train_views(step, config):
+                if capture_visualization:
+                    visualization_view_records.append(self._capture_gaussian_consensus_view_record(ray_bundle, batch))
                 with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
                     model_outputs = self.pipeline._model(ray_bundle)
                     metrics_dict = self.pipeline.model.get_metrics_dict(model_outputs, batch)
@@ -847,6 +1373,10 @@ class Trainer:
                         self._update_gaussian_consensus_accumulator(
                             param, consensus_accumulators[group], param.grad, config
                         )
+                        if group in visualization_view_grads:
+                            visualization_view_grads[group].append(
+                                self._clone_gaussian_consensus_visualization_grad(param, param.grad, config)
+                            )
                     else:
                         grad = param.grad
                         if grad is None:
@@ -856,6 +1386,8 @@ class Trainer:
                             if config.gaussian_consensus_store_grads_on_cpu:
                                 grad_for_view = grad_for_view.cpu()
                         view_grads[group].append(grad_for_view)
+                        if group in visualization_view_grads:
+                            visualization_view_grads[group].append(grad_for_view)
                 if refine_consensus:
                     self._update_gaussian_consensus_refinement_state(self.pipeline.model.info)
 
@@ -877,7 +1409,19 @@ class Trainer:
                     group, param, view_grads[group], config
                 )
             param.grad = consensus_grad
+            if group in visualization_groups:
+                visualization_final_grads[group] = consensus_grad.detach()
             consensus_stats.update(stats)
+
+        if capture_visualization:
+            self._write_gaussian_consensus_visualization_snapshot(
+                step=step,
+                config=config,
+                groups=visualization_groups,
+                view_records=visualization_view_records,
+                view_grads=visualization_view_grads,
+                final_grads=visualization_final_grads,
+            )
 
         needs_step = [
             group
@@ -902,6 +1446,13 @@ class Trainer:
             for group in needs_step:
                 if group in self.optimizers.schedulers:
                     self.optimizers.scheduler_step(group)
+
+        if capture_visualization:
+            self._append_gaussian_consensus_visualization_post_step_rgb(
+                step=step,
+                config=config,
+                view_records=visualization_view_records,
+            )
 
         if refine_consensus:
             consensus_stats.update(self._step_gaussian_consensus_refinement(step, config))

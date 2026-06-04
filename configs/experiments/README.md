@@ -189,6 +189,53 @@ These keys live under `consensus`.
 | `store_grads_on_cpu` | bool | Compatibility option for stored accumulation. Usually leave this alone. |
 | `densify_min_view_support` | integer | Minimum consensus visibility support for densification when densification is enabled. |
 
+## Offline Consensus Visualization
+
+Enable sparse training-time snapshots with `consensus.visualization`. These snapshots are self-contained: the PNG panels and `snapshot.npz` can be inspected later with the standalone Streamlit app without Nerfstudio, CUDA, or gsplat.
+
+```yaml
+consensus:
+  mode: online
+  num_views: 4
+  trainable: [features_dc, features_rest, opacities]
+  visualization:
+    enabled: true
+    interval: 500
+    window: 11
+    output_dir: consensus_visualizations
+    groups: []
+    save_png: true
+    save_npz: true
+```
+
+`interval: 500` and `window: 11` captures 11 consecutive training steps at each interval boundary, for example `500-510`, `1000-1010`, and so on.
+
+Snapshots are written under the training run directory:
+
+```text
+outputs/<experiment_name>/<run_name>/<timestamp>/consensus_visualizations/
+  index.json
+  step_000015500/
+    manifest.json
+    snapshot.npz
+    preview_dashboard.png
+    panels/*.png
+```
+
+`groups: []` means "use the consensus trainable groups." The first implementation saves rendered anchor-camera maps for per-view update norms, visible view count, mean/final update norms, agreement/disagreement, dominant view, dominance strength, suppression ratio, signed RGB updates from `features_dc`, and signed opacity updates from `opacities`. It also saves the anchor-camera model RGB before the optimizer step and after the optimizer step. `features_rest` contributes to norms and agreement but is not converted into a signed color-effect map yet.
+
+Preview dashboards use fixed ranges for the comparable rows: agreement/disagreement and other unit ratios are shown on `0..1`, and all update-norm panels in a dashboard share `0..max(update norm)` for that capture. The Streamlit app groups snapshots by capture window and defaults map color ranges to the selected window, so nearby steps are comparable. You can switch the scale scope to all captures or only the current step in the sidebar.
+
+To review results from a separate Streamlit environment, you can pass the broad `outputs` directory and choose the run inside the app:
+
+```bash
+streamlit run scripts/consensus_visualization_app.py -- outputs
+```
+
+You can also pass a specific experiment, run, timestamp, or `consensus_visualizations` directory directly.
+
+The standalone app expects `streamlit`, `numpy`, `pillow`, and `plotly` in that viewing environment. Streamlit is not part of the main Nerfstudio training dependencies.
+
 ## Common Top-Level Keys
 
 These keys can be placed in `defaults` or in an individual run.
