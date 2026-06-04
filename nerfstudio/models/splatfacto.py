@@ -19,6 +19,7 @@ Gaussian Splatting implementation that combines many recent advancements.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
@@ -196,6 +197,13 @@ class SplatfactoModelConfig(ModelConfig):
     """Small value used for consensus visibility and normalization checks."""
     gaussian_consensus_densify_min_view_support: int = 2
     """Minimum accumulated visible view observations required before consensus densification can split/clone a Gaussian."""
+    output_gradient_visualization: bool = True
+    """If True, expose per-Gaussian gradient/update maps as native viewer render outputs."""
+    gaussian_gradient_visualization_groups: Tuple[str, ...] = ()
+    """Gaussian parameter groups included in aggregate and per-group gradient visualizations.
+
+    Empty uses consensus groups or all Gaussian groups.
+    """
 
 
 class SplatfactoModel(Model):
@@ -514,6 +522,198 @@ class SplatfactoModel(Model):
         )
         return out["rgb"]
 
+    def _get_gradient_visualization_groups(self) -> Tuple[str, ...]:
+        if len(self.config.gaussian_gradient_visualization_groups) > 0:
+            return self.config.gaussian_gradient_visualization_groups
+        if self.config.gaussian_consensus_enabled:
+            return self.config.gaussian_consensus_trainable_param_groups
+        return tuple(self.gauss_params.keys())
+
+    def _get_optimizer_lr(self, group: str) -> float:
+        optimizers = getattr(self, "optimizers", {})
+        if not isinstance(optimizers, dict) or group not in optimizers:
+            return 1.0
+        optimizer = optimizers[group]
+        if len(optimizer.param_groups) == 0:
+            return 1.0
+        return float(optimizer.param_groups[0].get("lr", 1.0))
+
+    def _get_optimizer_update_norm_sq(
+        self, group: str, param: torch.Tensor, grad_norm_sq: torch.Tensor
+    ) -> torch.Tensor:
+        lr = self._get_optimizer_lr(group)
+        optimizers = getattr(self, "optimizers", {})
+        if not isinstance(optimizers, dict) or group not in optimizers:
+            return grad_norm_sq * (lr * lr)
+
+        optimizer = optimizers[group]
+        if len(optimizer.param_groups) == 0:
+            return grad_norm_sq * (lr * lr)
+
+        param_group = optimizer.param_groups[0]
+        state = optimizer.state.get(param, {})
+        exp_avg = state.get("exp_avg") if isinstance(state, dict) else None
+        exp_avg_sq = state.get("exp_avg_sq") if isinstance(state, dict) else None
+        step = state.get("step", 0) if isinstance(state, dict) else 0
+        if not isinstance(exp_avg, torch.Tensor) or not isinstance(exp_avg_sq, torch.Tensor):
+            return grad_norm_sq * (lr * lr)
+        if exp_avg.shape != param.shape or exp_avg_sq.shape != param.shape:
+            return grad_norm_sq * (lr * lr)
+
+        step_value = float(step.item()) if isinstance(step, torch.Tensor) else float(step)
+        if step_value <= 0:
+            return grad_norm_sq * (lr * lr)
+
+        beta1, beta2 = param_group.get("betas", (0.9, 0.999))
+        bias_correction1 = 1.0 - beta1**step_value
+        bias_correction2 = 1.0 - beta2**step_value
+        if bias_correction1 <= 0.0 or bias_correction2 <= 0.0:
+            return grad_norm_sq * (lr * lr)
+
+        eps = float(param_group.get("eps", 1e-8))
+        denom = exp_avg_sq.sqrt() / math.sqrt(bias_correction2)
+        update = exp_avg / denom.add(eps) * (lr / bias_correction1)
+        return update.detach().reshape(self.num_points, -1).square().sum(dim=-1)
+
+    def _get_cached_gradient_visualization_values(self) -> Dict[str, torch.Tensor]:
+        cached = getattr(self, "_last_gradient_visualization_values", {})
+        if not isinstance(cached, dict):
+            return {}
+        return {
+            name: value.to(device=self.device, dtype=self.means.dtype)
+            for name, value in cached.items()
+            if isinstance(value, torch.Tensor) and value.shape == (self.num_points,)
+        }
+
+    def _sanitize_gradient_visualization_values(self, values: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {
+            name: torch.nan_to_num(
+                value.to(device=self.device, dtype=self.means.dtype), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            .abs()
+            .reshape(self.num_points)
+            for name, value in values.items()
+            if value.shape[0] == self.num_points
+        }
+
+    def _cache_gradient_visualization_values(self, values: Dict[str, torch.Tensor]) -> None:
+        self._last_gradient_visualization_values = {
+            name: value.detach().clone()
+            for name, value in values.items()
+            if value.shape == (self.num_points,)
+        }
+
+    @torch.no_grad()
+    def _get_gradient_visualization_values(self) -> Dict[str, torch.Tensor]:
+        values: Dict[str, torch.Tensor] = {}
+        if self.training or not self.config.output_gradient_visualization or self.num_points == 0:
+            return values
+
+        gradient_sq = None
+        update_sq = None
+        for group in self._get_gradient_visualization_groups():
+            if group not in self.gauss_params:
+                continue
+            grad = self.gauss_params[group].grad
+            if grad is None or grad.shape[0] != self.num_points:
+                continue
+            grad_norm_sq = grad.detach().reshape(self.num_points, -1).square().sum(dim=-1)
+            values[f"gaussian_gradient_norm_{group}"] = grad_norm_sq.clamp_min(0.0).sqrt()
+            gradient_sq = grad_norm_sq if gradient_sq is None else gradient_sq + grad_norm_sq
+            update_norm_sq = self._get_optimizer_update_norm_sq(group, self.gauss_params[group], grad_norm_sq)
+            update_sq = update_norm_sq if update_sq is None else update_sq + update_norm_sq
+
+        if gradient_sq is not None:
+            values["gaussian_gradient_norm"] = gradient_sq.clamp_min(0.0).sqrt()
+        if update_sq is not None:
+            values["gaussian_update_norm"] = update_sq.clamp_min(0.0).sqrt()
+
+        state = getattr(self, "strategy_state", {})
+        if isinstance(state, dict) and "grad2d" in state:
+            grad2d = state["grad2d"]
+            if isinstance(grad2d, torch.Tensor) and grad2d.shape[0] == self.num_points:
+                densify_gradient = grad2d.detach().reshape(self.num_points, -1)
+                count = state.get("count")
+                if isinstance(count, torch.Tensor) and count.shape[0] == self.num_points:
+                    count = count.detach().clamp_min(1.0).reshape(self.num_points, -1)
+                    densify_gradient = densify_gradient / count
+                if densify_gradient.shape[-1] == 1:
+                    densify_gradient = densify_gradient.squeeze(-1)
+                else:
+                    densify_gradient = densify_gradient.norm(dim=-1)
+                values["gaussian_densify_gradient"] = densify_gradient
+
+        values = self._sanitize_gradient_visualization_values(values)
+        cached_values = self._get_cached_gradient_visualization_values()
+        cached_values.update(values)
+        if len(cached_values) > 0:
+            self._cache_gradient_visualization_values(cached_values)
+        return cached_values
+
+    @torch.no_grad()
+    def _render_gradient_visualization_outputs(
+        self,
+        means: torch.Tensor,
+        quats: torch.Tensor,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+        crop_ids: Optional[torch.Tensor],
+        viewmat: torch.Tensor,
+        K: torch.Tensor,
+        W: int,
+        H: int,
+    ) -> Dict[str, torch.Tensor]:
+        values = self._get_gradient_visualization_values()
+        if len(values) == 0 or means.shape[0] == 0:
+            return {}
+
+        rendered_outputs: Dict[str, torch.Tensor] = {}
+        items: List[Tuple[str, torch.Tensor]] = []
+        for name, value in values.items():
+            if value.shape[0] != self.num_points:
+                continue
+            if crop_ids is not None:
+                value = value[crop_ids]
+            if value.shape[0] == means.shape[0]:
+                items.append((name, value))
+
+        eps = self.config.gaussian_consensus_eps
+        for start in range(0, len(items), 3):
+            chunk = items[start : start + 3]
+            colors = means.new_zeros((means.shape[0], 3))
+            for channel, (_, value) in enumerate(chunk):
+                colors[:, channel] = value
+
+            render, alpha, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+                means=means,
+                quats=quats,
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(opacities).squeeze(-1),
+                colors=colors,
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=None,
+                sparse_grad=False,
+                absgrad=False,
+                rasterize_mode=self.config.rasterize_mode,
+            )
+            alpha = alpha[:, ...]
+            normalized_render = torch.where(
+                alpha > eps,
+                render / alpha.clamp_min(eps),
+                torch.zeros_like(render),
+            )
+            for channel, (name, _) in enumerate(chunk):
+                rendered_outputs[name] = normalized_render.squeeze(0)[..., channel : channel + 1]
+
+        return rendered_outputs
+
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs.
 
@@ -632,12 +832,26 @@ class SplatfactoModel(Model):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
-        return {
+        outputs = {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
         }  # type: ignore
+        outputs.update(
+            self._render_gradient_visualization_outputs(
+                means=means_crop,
+                quats=quats_crop,
+                scales=scales_crop,
+                opacities=opacities_crop,
+                crop_ids=crop_ids,
+                viewmat=viewmat,
+                K=K,
+                W=W,
+                H=H,
+            )
+        )
+        return outputs
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
