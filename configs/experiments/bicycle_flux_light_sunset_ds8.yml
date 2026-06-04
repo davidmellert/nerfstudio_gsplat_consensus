@@ -1,0 +1,101 @@
+# Run with: ns-experiment --config configs/experiments/bicycle_flux_light_sunset_ds8.yml
+suite_name: bicycle_flux_light_sunset_ds8_consensus_sweep
+
+defaults:
+  method: splatfacto-colmap
+  data: data/bicycle_ns
+  experiment_name: bicycle_ns_flux_light_sunset_ds8
+  output_dir: outputs
+  vis: tensorboard
+  downscale_factor: 8
+  load_dir: outputs/bicycle_ns/splatfacto-colmap/2026-05-27_221222/nerfstudio_models
+  load_step: 14999
+  logging:
+    steps_per_log: 1
+  trainer:
+    max_num_iterations: 16000
+    steps_per_eval_batch: 0
+    steps_per_eval_image: 0
+    steps_per_eval_all_images: 0
+  datamanager:
+    cache_images: cpu
+  dataparser:
+    images_path: images_edited_flux_light_sunset
+    skip_missing_images: true
+    auto_downscale_missing_images: false
+    eval_mode: all
+  model:
+    stop_split_at: 16000
+  consensus:
+    mode: standard
+    aggregator: cosine
+    num_views: 1
+    max_views_per_gaussian: 4
+    densify_min_view_support: 3
+    densification: false
+    trainable: all
+  render:
+    enabled: true
+    name: circle-path
+    camera_path_filename: outputs/bicycle_ns/splatfacto-colmap/2026-05-27_221222/camera_paths/circle_path.json
+    output_dir: renders
+    output_format: video
+    rendered_output_names: [rgb]
+
+runs:
+  - name: standard-1view-all-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: standard
+      num_views: 1
+      trainable: all
+
+  - name: standard-1view-color-opacity-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: standard
+      num_views: 1
+      trainable: [features_dc, features_rest, opacities]
+
+  - name: standard-1view-appearance-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: standard
+      num_views: 1
+      trainable: [features_dc, features_rest]
+
+  - name: online-4views-all-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: online
+      num_views: 4
+      trainable: all
+
+  - name: online-4views-color-opacity-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: online
+      num_views: 4
+      trainable: [features_dc, features_rest, opacities]
+
+  - name: online-4views-appearance-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: online
+      num_views: 4
+      trainable: [features_dc, features_rest]
+
+  - name: consensus-4views-cosine-all-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: consensus
+      aggregator: cosine
+      num_views: 4
+      trainable: all
+
+  - name: consensus-4views-cosine-color-opacity-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: consensus
+      aggregator: cosine
+      num_views: 4
+      trainable: [features_dc, features_rest, opacities]
+
+  - name: consensus-4views-cosine-appearance-no-densify-flux_light_sunset-ds8
+    consensus:
+      mode: consensus
+      aggregator: cosine
+      num_views: 4
+      trainable: [features_dc, features_rest]
