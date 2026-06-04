@@ -706,6 +706,16 @@ class Trainer:
             raise RuntimeError("gaussian_consensus_num_views must be at least 1.")
 
         trainable_groups = self._get_gaussian_consensus_param_groups()
+        refine_consensus = not config.gaussian_consensus_disable_refinement
+        if refine_consensus:
+            required_groups = {"means", "scales", "quats", "features_dc", "features_rest", "opacities"}
+            missing_groups = sorted(required_groups.difference(trainable_groups))
+            if missing_groups:
+                raise RuntimeError(
+                    "Gaussian consensus densification requires all Gaussian parameter groups to be trainable. "
+                    f"Missing groups: {missing_groups}"
+                )
+
         consensus_accumulators = {
             group: self._new_gaussian_consensus_accumulator(self.optimizers.parameters[group][0])
             for group in trainable_groups
@@ -731,6 +741,8 @@ class Trainer:
                     self._update_gaussian_consensus_accumulator(
                         param, consensus_accumulators[group], param.grad, config
                     )
+                if refine_consensus:
+                    self._update_gaussian_consensus_refinement_state(self.pipeline.model.info)
 
                 loss_dicts.append({key: value.detach() for key, value in loss_dict.items()})
                 metrics_dicts.append(metrics_dict)
@@ -771,6 +783,9 @@ class Trainer:
                 if group in self.optimizers.schedulers:
                     self.optimizers.scheduler_step(group)
 
+        if refine_consensus:
+            consensus_stats.update(self._step_gaussian_consensus_refinement(step, config))
+
         loss_dict = self._mean_logged_dicts(loss_dicts)
         metrics_dict = self._mean_logged_dicts(metrics_dicts)
         metrics_dict.update(consensus_stats)
@@ -786,6 +801,81 @@ class Trainer:
         if strategy is None or not hasattr(strategy, "_update_state"):
             raise RuntimeError("Sequential Gaussian batch refinement currently requires the default gsplat strategy.")
         strategy._update_state(model.gauss_params, model.strategy_state, info, packed=False)
+
+    def _update_gaussian_consensus_refinement_state(self, info: Dict[str, torch.Tensor]) -> None:
+        model = self.pipeline.model
+        strategy = getattr(model, "strategy", None)
+        if strategy is None or not hasattr(strategy, "_update_state"):
+            raise RuntimeError("Gaussian consensus densification currently requires the default gsplat strategy.")
+        strategy._update_state(model.gauss_params, model.strategy_state, info, packed=False)
+
+    @torch.no_grad()
+    def _step_gaussian_consensus_refinement(self, step: int, config) -> Dict[str, torch.Tensor]:
+        model = self.pipeline.model
+        strategy = getattr(model, "strategy", None)
+        if strategy is None or not all(hasattr(strategy, name) for name in ("_grow_gs", "_prune_gs")):
+            raise RuntimeError("Gaussian consensus densification currently requires the default gsplat strategy.")
+
+        state = model.strategy_state
+        stats: Dict[str, torch.Tensor] = {}
+        if step >= strategy.refine_stop_iter:
+            return stats
+
+        should_refine = (
+            step > strategy.refine_start_iter
+            and step % strategy.refine_every == 0
+            and step % strategy.reset_every >= strategy.pause_refine_after_reset
+        )
+        if should_refine:
+            min_support = max(1, int(getattr(config, "gaussian_consensus_densify_min_view_support", 1)))
+            count = state.get("count")
+            grad2d = state.get("grad2d")
+            if min_support > 1 and count is not None and grad2d is not None:
+                supported = count >= float(min_support)
+                avg_grad = grad2d / count.clamp_min(1.0)
+                wants_growth = avg_grad > strategy.grow_grad2d
+                radii = state.get("radii")
+                if step < strategy.refine_scale2d_stop_iter and radii is not None:
+                    wants_growth = wants_growth | (radii > strategy.grow_scale2d)
+                    radii.masked_fill_(~supported, 0.0)
+                blocked = wants_growth & ~supported
+                grad2d.masked_fill_(~supported, 0.0)
+                denom = torch.tensor(float(max(1, supported.numel())), device=supported.device)
+                stats["ConsensusDensify/support_fraction"] = supported.sum().to(dtype=torch.float32) / denom
+                stats["ConsensusDensify/blocked_growth_fraction"] = blocked.sum().to(dtype=torch.float32) / denom
+
+            n_dupli, n_split = strategy._grow_gs(model.gauss_params, model.optimizers, state, step)
+            if strategy.verbose:
+                print(
+                    f"Step {step}: {n_dupli} consensus-supported GSs duplicated, {n_split} split. "
+                    f"Now having {len(model.gauss_params['means'])} GSs."
+                )
+
+            n_prune = strategy._prune_gs(model.gauss_params, model.optimizers, state, step)
+            if strategy.verbose:
+                print(f"Step {step}: {n_prune} GSs pruned. Now having {len(model.gauss_params['means'])} GSs.")
+
+            stats["ConsensusDensify/duplicated"] = torch.tensor(float(n_dupli), device=self.device)
+            stats["ConsensusDensify/split"] = torch.tensor(float(n_split), device=self.device)
+            stats["ConsensusDensify/pruned"] = torch.tensor(float(n_prune), device=self.device)
+
+            state["grad2d"].zero_()
+            state["count"].zero_()
+            if strategy.refine_scale2d_stop_iter > 0:
+                state["radii"].zero_()
+            torch.cuda.empty_cache()
+
+        if step % strategy.reset_every == 0:
+            from gsplat.strategy.ops import reset_opa
+
+            reset_opa(
+                params=model.gauss_params,
+                optimizers=model.optimizers,
+                state=state,
+                value=strategy.prune_opa * 2.0,
+            )
+
+        return stats
 
     def _step_gaussian_batch_refinement(self, step: int, info: Dict[str, torch.Tensor]) -> None:
         model = self.pipeline.model

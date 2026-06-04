@@ -194,6 +194,8 @@ class SplatfactoModelConfig(ModelConfig):
     """Number of Gaussians to aggregate at once for each optimizer group."""
     gaussian_consensus_eps: float = 1e-8
     """Small value used for consensus visibility and normalization checks."""
+    gaussian_consensus_densify_min_view_support: int = 2
+    """Minimum accumulated visible view observations required before consensus densification can split/clone a Gaussian."""
 
 
 class SplatfactoModel(Model):
@@ -392,9 +394,7 @@ class SplatfactoModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
-        if self.config.gaussian_consensus_enabled and (
-            self.config.gaussian_consensus_disable_refinement or self.config.gaussian_consensus_mode == "batch"
-        ):
+        if self.config.gaussian_consensus_enabled:
             return
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(

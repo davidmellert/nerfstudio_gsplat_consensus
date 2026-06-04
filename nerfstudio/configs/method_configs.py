@@ -846,6 +846,37 @@ method_configs["splatfacto-gaussian-consensus-colmap"].pipeline.datamanager.data
     eval_mode="all",
 )
 
+method_configs["splatfacto-gaussian-consensus-densify"] = copy.deepcopy(
+    method_configs["splatfacto-gaussian-consensus"]
+)
+method_configs["splatfacto-gaussian-consensus-densify"].method_name = "splatfacto-gaussian-consensus-densify"
+method_configs[
+    "splatfacto-gaussian-consensus-densify"
+].pipeline.model.gaussian_consensus_disable_refinement = False  # type: ignore[attr-defined]
+method_configs[
+    "splatfacto-gaussian-consensus-densify"
+].pipeline.model.gaussian_consensus_trainable_param_groups = (  # type: ignore[attr-defined]
+    "means",
+    "scales",
+    "quats",
+    "features_dc",
+    "features_rest",
+    "opacities",
+)
+
+method_configs["splatfacto-gaussian-consensus-densify-colmap"] = copy.deepcopy(
+    method_configs["splatfacto-gaussian-consensus-densify"]
+)
+method_configs["splatfacto-gaussian-consensus-densify-colmap"].method_name = (
+    "splatfacto-gaussian-consensus-densify-colmap"
+)
+method_configs["splatfacto-gaussian-consensus-densify-colmap"].pipeline.datamanager.dataparser = ColmapDataParserConfig(
+    load_3D_points=True,
+    skip_missing_images=True,
+    auto_downscale_missing_images=False,
+    eval_mode="all",
+)
+
 method_configs["splatfacto-gaussian-batch"] = copy.deepcopy(method_configs["splatfacto-gaussian-consensus"])
 method_configs["splatfacto-gaussian-batch"].method_name = "splatfacto-gaussian-batch"
 method_configs[
