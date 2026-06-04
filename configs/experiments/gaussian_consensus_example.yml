@@ -1,0 +1,65 @@
+# Run with: ns-experiment --config configs/experiments/gaussian_consensus_example.yml
+suite_name: bicycle-consensus-sweep
+
+defaults:
+  method: splatfacto-colmap
+  data: data/bicycle_ns
+  experiment_name: bicycle_ns_metrics
+  output_dir: outputs
+  vis: tensorboard
+  downscale_factor: 8
+  load_dir: outputs/bicycle_ns/splatfacto-colmap/2026-05-27_221222/nerfstudio_models
+  logging:
+    steps_per_log: 1
+  trainer:
+    max_num_iterations: 17000
+    steps_per_eval_batch: 0
+    steps_per_eval_image: 0
+    steps_per_eval_all_images: 0
+  datamanager:
+    cache_images: cpu
+  dataparser:
+    images_path: images_edited_sunset10
+    skip_missing_images: true
+    auto_downscale_missing_images: false
+    eval_mode: all
+  model:
+    stop_split_at: 17000
+  consensus:
+    mode: standard
+    aggregator: cosine
+    num_views: 1
+    max_views_per_gaussian: 8
+    densify_min_view_support: 3
+    densification: false
+    trainable: all
+  render:
+    enabled: false
+    name: circle-path
+    camera_path_filename: outputs/bicycle_ns/splatfacto-colmap/2026-05-27_221222/camera_paths/circle_path.json
+    output_dir: renders
+    output_format: video
+    rendered_output_names: [rgb]
+
+runs:
+  - name: standard-1view-all-no-densify-sunset10
+    consensus:
+      mode: standard
+      num_views: 1
+
+  - name: consensus-8views-all-no-densify-sunset10
+    consensus:
+      mode: consensus
+      num_views: 8
+
+  - name: online-8views-all-no-densify-sunset10
+    consensus:
+      mode: online
+      num_views: 8
+
+  - name: online-8views-all-densify-sunset10
+    consensus:
+      mode: online
+      num_views: 8
+      densification: true
+      trainable: all

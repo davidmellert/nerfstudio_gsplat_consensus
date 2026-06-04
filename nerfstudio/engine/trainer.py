@@ -500,6 +500,24 @@ class Trainer:
             return model_config
         return None
 
+    def _get_gaussian_trainable_param_groups(self) -> Optional[List[str]]:
+        model_config = getattr(self.pipeline.model, "config", None)
+        groups = getattr(model_config, "gaussian_trainable_param_groups", None) if model_config is not None else None
+        if groups is None:
+            return None
+
+        groups = list(groups)
+        if len(groups) == 0:
+            raise RuntimeError("Gaussian training needs at least one trainable parameter group.")
+        gauss_params = getattr(self.pipeline.model, "gauss_params", {})
+        missing = [group for group in groups if group not in self.optimizers.parameters or group not in gauss_params]
+        if missing:
+            raise RuntimeError(
+                "Configured Gaussian trainable groups must be Gaussian optimizer groups. "
+                f"Missing or invalid groups: {missing}"
+            )
+        return groups
+
     def _get_gaussian_consensus_param_groups(self) -> List[str]:
         config = self._get_gaussian_consensus_config()
         assert config is not None
@@ -650,6 +668,85 @@ class Trainer:
             stats[f"Consensus/{group_name}_avg_agreement"] = agreement_total / agreement_count.clamp_min(1.0)
         return consensus_grad, stats
 
+    @torch.no_grad()
+    def _aggregate_stored_gaussian_consensus_group(
+        self,
+        group_name: str,
+        param: torch.Tensor,
+        view_grads: List[torch.Tensor],
+        config,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if len(view_grads) == 1:
+            grad = view_grads[0].to(device=param.device, dtype=param.dtype, non_blocking=True)
+            return grad, {}
+
+        num_gaussians = param.shape[0]
+        if num_gaussians == 0:
+            return torch.zeros_like(param), {}
+
+        device = param.device
+        dtype = param.dtype
+        eps = config.gaussian_consensus_eps
+        max_views = config.gaussian_consensus_max_views_per_gaussian
+        chunk_size = max(1, config.gaussian_consensus_gaussian_chunk_size)
+        consensus_grad = torch.empty_like(param)
+        visible_total = torch.zeros((), device=device)
+        active_total = torch.zeros((), device=device)
+        updated_total = torch.zeros((), device=device)
+
+        for start in range(0, num_gaussians, chunk_size):
+            end = min(start + chunk_size, num_gaussians)
+            grads = torch.stack(
+                [grad[start:end].to(device=device, dtype=dtype, non_blocking=True) for grad in view_grads], dim=0
+            )
+            flat_grads = grads.reshape(grads.shape[0], grads.shape[1], -1)
+            grad_norms = flat_grads.norm(dim=-1)
+            visible = grad_norms > eps
+
+            if max_views > 0 and max_views < grads.shape[0]:
+                top_values, top_indices = grad_norms.topk(k=max_views, dim=0)
+                top_visible = torch.zeros_like(visible)
+                top_visible.scatter_(0, top_indices, top_values > eps)
+                visible = visible & top_visible
+
+            mean_weights = visible.to(dtype=flat_grads.dtype)
+            visible_counts = mean_weights.sum(dim=0)
+            mean_grad = (flat_grads * mean_weights[..., None]).sum(dim=0)
+            mean_grad = mean_grad / visible_counts.clamp_min(1.0)[..., None]
+
+            if config.gaussian_consensus_aggregator == "mean":
+                weights = mean_weights
+            elif config.gaussian_consensus_aggregator == "cosine":
+                alignment = torch.nn.functional.cosine_similarity(
+                    flat_grads, mean_grad.unsqueeze(0), dim=-1, eps=eps
+                )
+                weights = torch.where(
+                    alignment > config.gaussian_consensus_min_alignment,
+                    alignment,
+                    torch.zeros_like(alignment),
+                )
+                weights = weights * mean_weights
+            else:
+                raise RuntimeError(f"Unknown Gaussian consensus aggregator: {config.gaussian_consensus_aggregator}")
+
+            weight_sum = weights.sum(dim=0)
+            aggregate = (flat_grads * weights[..., None]).sum(dim=0)
+            aggregate = aggregate / weight_sum.clamp_min(eps)[..., None]
+            aggregate = torch.where(weight_sum[..., None] > eps, aggregate, torch.zeros_like(aggregate))
+            consensus_grad[start:end].copy_(aggregate.reshape_as(grads[0]))
+
+            visible_total += visible_counts.sum()
+            active_total += (visible_counts > 0).sum()
+            updated_total += (weight_sum > eps).sum()
+
+        denom = torch.tensor(float(num_gaussians), device=device)
+        stats = {
+            f"Consensus/{group_name}_avg_visible_views": visible_total / denom,
+            f"Consensus/{group_name}_active_fraction": active_total / denom,
+            f"Consensus/{group_name}_updated_fraction": updated_total / denom,
+        }
+        return consensus_grad, stats
+
     def _mean_logged_dicts(self, dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         if len(dicts) == 0:
             return {}
@@ -716,10 +813,18 @@ class Trainer:
                     f"Missing groups: {missing_groups}"
                 )
 
-        consensus_accumulators = {
-            group: self._new_gaussian_consensus_accumulator(self.optimizers.parameters[group][0])
-            for group in trainable_groups
-        }
+        accumulation = getattr(config, "gaussian_consensus_accumulation", "online")
+        if accumulation not in ("online", "stored"):
+            raise RuntimeError(f"Unknown Gaussian consensus accumulation mode: {accumulation}")
+        if accumulation == "online":
+            consensus_accumulators = {
+                group: self._new_gaussian_consensus_accumulator(self.optimizers.parameters[group][0])
+                for group in trainable_groups
+            }
+            view_grads: Dict[str, List[torch.Tensor]] = {}
+        else:
+            consensus_accumulators = {}
+            view_grads = {group: [] for group in trainable_groups}
         loss_dicts: List[Dict[str, torch.Tensor]] = []
         metrics_dicts: List[Dict[str, torch.Tensor]] = []
         losses: List[torch.Tensor] = []
@@ -738,9 +843,19 @@ class Trainer:
                 self.grad_scaler.scale(loss).backward()  # type: ignore
                 for group in trainable_groups:
                     param = self.optimizers.parameters[group][0]
-                    self._update_gaussian_consensus_accumulator(
-                        param, consensus_accumulators[group], param.grad, config
-                    )
+                    if accumulation == "online":
+                        self._update_gaussian_consensus_accumulator(
+                            param, consensus_accumulators[group], param.grad, config
+                        )
+                    else:
+                        grad = param.grad
+                        if grad is None:
+                            grad_for_view = torch.zeros(param.shape, dtype=param.dtype, device="cpu")
+                        else:
+                            grad_for_view = grad.detach().clone()
+                            if config.gaussian_consensus_store_grads_on_cpu:
+                                grad_for_view = grad_for_view.cpu()
+                        view_grads[group].append(grad_for_view)
                 if refine_consensus:
                     self._update_gaussian_consensus_refinement_state(self.pipeline.model.info)
 
@@ -753,9 +868,14 @@ class Trainer:
         consensus_stats: Dict[str, torch.Tensor] = {}
         for group in trainable_groups:
             param = self.optimizers.parameters[group][0]
-            consensus_grad, stats = self._finalize_gaussian_consensus_group(
-                group, param, consensus_accumulators[group], config
-            )
+            if accumulation == "online":
+                consensus_grad, stats = self._finalize_gaussian_consensus_group(
+                    group, param, consensus_accumulators[group], config
+                )
+            else:
+                consensus_grad, stats = self._aggregate_stored_gaussian_consensus_group(
+                    group, param, view_grads[group], config
+                )
             param.grad = consensus_grad
             consensus_stats.update(stats)
 
@@ -995,20 +1115,43 @@ class Trainer:
                 return self.gaussian_batch_train_iteration(step)
             raise RuntimeError(f"Unknown Gaussian consensus training mode: {gaussian_consensus_mode}")
 
+        trainable_groups = self._get_gaussian_trainable_param_groups()
+        if trainable_groups is not None:
+            model_config = getattr(self.pipeline.model, "config", None)
+            refinement_disabled = bool(getattr(model_config, "gaussian_disable_refinement", False))
+            if not refinement_disabled:
+                required_groups = {"means", "scales", "quats", "features_dc", "features_rest", "opacities"}
+                missing_groups = sorted(required_groups.difference(trainable_groups))
+                if missing_groups:
+                    raise RuntimeError(
+                        "Standard Gaussian densification requires all Gaussian parameter groups to be trainable. "
+                        "Disable densification or enable these groups: "
+                        f"{missing_groups}"
+                    )
+        active_param_groups = (
+            trainable_groups if trainable_groups is not None else list(self.optimizers.parameters.keys())
+        )
+
         needs_zero = [
-            group for group in self.optimizers.parameters.keys() if step % self.gradient_accumulation_steps[group] == 0
+            group for group in active_param_groups if step % self.gradient_accumulation_steps[group] == 0
         ]
         self.optimizers.zero_grad_some(needs_zero)
         cpu_or_cuda_str: str = self.device.split(":")[0]
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
-        with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
-            _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
-            loss = functools.reduce(torch.add, loss_dict.values())
+        if trainable_groups is None:
+            with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+                _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
+                loss = functools.reduce(torch.add, loss_dict.values())
+        else:
+            with self._only_consensus_groups_require_grad(trainable_groups):
+                with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
+                    _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
+                    loss = functools.reduce(torch.add, loss_dict.values())
         self.grad_scaler.scale(loss).backward()  # type: ignore
         needs_step = [
             group
-            for group in self.optimizers.parameters.keys()
+            for group in active_param_groups
             if step % self.gradient_accumulation_steps[group] == self.gradient_accumulation_steps[group] - 1
         ]
         self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
@@ -1028,7 +1171,12 @@ class Trainer:
         self.grad_scaler.update()
         # If the gradient scaler is decreased, no optimization step is performed so we should not step the scheduler.
         if scale <= self.grad_scaler.get_scale():
-            self.optimizers.scheduler_step_all(step)
+            if trainable_groups is None:
+                self.optimizers.scheduler_step_all(step)
+            else:
+                for group in needs_step:
+                    if group in self.optimizers.schedulers:
+                        self.optimizers.scheduler_step(group)
 
         # Merging loss and metrics dict into a single output.
         return loss, loss_dict, metrics_dict  # type: ignore

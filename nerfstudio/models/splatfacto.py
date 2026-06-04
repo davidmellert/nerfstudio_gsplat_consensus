@@ -167,6 +167,10 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
     gaussian_consensus_enabled: bool = False
     """If True, use Gaussian soft consensus training instead of the standard single-view update."""
+    gaussian_trainable_param_groups: Optional[Tuple[str, ...]] = None
+    """If set, only these Gaussian optimizer groups are updated during standard training."""
+    gaussian_disable_refinement: bool = False
+    """If True, disable gsplat densification/culling/reset callbacks during standard training."""
     gaussian_consensus_mode: Literal["consensus", "batch"] = "consensus"
     """Training mode for multi-view edit refinement. "batch" averages full per-view gradients sequentially."""
     gaussian_consensus_num_views: int = 4
@@ -183,6 +187,8 @@ class SplatfactoModelConfig(ModelConfig):
     """Weight for viewing-direction distance when ranking nearby edited train views."""
     gaussian_consensus_aggregator: Literal["mean", "cosine"] = "cosine"
     """How to aggregate visible per-view Gaussian gradients."""
+    gaussian_consensus_accumulation: Literal["online", "stored"] = "online"
+    """How to collect per-view consensus gradients. "online" streams accumulators; "stored" keeps per-view grads."""
     gaussian_consensus_min_alignment: float = 0.0
     """Minimum cosine alignment used by the cosine aggregator. 0 ignores opposing view gradients."""
     gaussian_consensus_trainable_param_groups: Tuple[str, ...] = ("features_dc", "features_rest")
@@ -402,6 +408,8 @@ class SplatfactoModel(Model):
 
     def step_post_backward(self, step):
         assert step == self.step
+        if self.config.gaussian_disable_refinement:
+            return
         if self.config.gaussian_consensus_enabled:
             return
         if isinstance(self.strategy, DefaultStrategy):
@@ -807,6 +815,7 @@ class SplatfactoModel(Model):
         )
         if (
             self.training
+            and not self.config.gaussian_disable_refinement
             and not (self.config.gaussian_consensus_enabled and self.config.gaussian_consensus_disable_refinement)
         ):
             self.strategy.step_pre_backward(
