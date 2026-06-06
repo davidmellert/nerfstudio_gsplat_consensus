@@ -488,12 +488,28 @@ class Trainer:
             },
             ckpt_path,
         )
+        # save agreement scores if accumulated
+        self._save_agreement_scores()
+
         # possibly delete old checkpoints
         if self.config.save_only_latest_checkpoint:
             # delete every other checkpoint in the checkpoint folder
             for f in self.checkpoint_dir.glob("*.ckpt"):
                 if f != ckpt_path:
                     f.unlink()
+
+    def _save_agreement_scores(self) -> None:
+        """Save per-Gaussian agreement scores to a file alongside checkpoints."""
+        model = self.pipeline.model
+        if not hasattr(model, "_agreement_sum") or not hasattr(model, "_agreement_count"):
+            return
+        agreement_data = {}
+        for group_name in model._agreement_sum:
+            count = model._agreement_count[group_name].clamp_min(1.0)
+            agreement_data[group_name] = model._agreement_sum[group_name] / count
+        out_path = self.checkpoint_dir / "agreement_scores.pt"
+        torch.save(agreement_data, out_path)
+        CONSOLE.log(f"[bold green]Saved agreement scores to {out_path}")
 
     def _save_dc_regularization_anchor(self) -> None:
         """Snapshot features_dc before fine-tuning so the DC regularizer has an anchor."""
@@ -540,6 +556,59 @@ class Trainer:
         finally:
             for param, requires_grad in previous_requires_grad.items():
                 param.requires_grad_(requires_grad)
+
+    def _compute_consensus_agreement(
+        self,
+        view_grads: List[torch.Tensor],
+        param: torch.Tensor,
+        config,
+    ) -> torch.Tensor:
+        """Compute per-Gaussian mean cosine agreement across visible views.
+
+        Returns a tensor of shape [num_gaussians] with agreement scores in [0, 1].
+        """
+        num_gaussians = param.shape[0]
+        if num_gaussians == 0:
+            return torch.zeros(0)
+
+        device = param.device
+        dtype = param.dtype
+        eps = config.gaussian_consensus_eps
+        max_views = config.gaussian_consensus_max_views_per_gaussian
+        chunk_size = max(1, config.gaussian_consensus_gaussian_chunk_size)
+        agreement = torch.zeros(num_gaussians)
+
+        for start in range(0, num_gaussians, chunk_size):
+            end = min(start + chunk_size, num_gaussians)
+            grads = torch.stack(
+                [g[start:end].to(device=device, dtype=dtype, non_blocking=True) for g in view_grads], dim=0
+            )
+            flat_grads = grads.reshape(grads.shape[0], grads.shape[1], -1)
+            grad_norms = flat_grads.norm(dim=-1)
+            visible = grad_norms > eps
+
+            if max_views > 0 and max_views < grads.shape[0]:
+                top_values, top_indices = grad_norms.topk(k=max_views, dim=0)
+                top_visible = torch.zeros_like(visible)
+                top_visible.scatter_(0, top_indices, top_values > eps)
+                visible = visible & top_visible
+
+            mean_weights = visible.to(dtype=flat_grads.dtype)
+            visible_counts = mean_weights.sum(dim=0)
+            mean_grad = (flat_grads * mean_weights[..., None]).sum(dim=0)
+            mean_grad = mean_grad / visible_counts.clamp_min(1.0)[..., None]
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                flat_grads, mean_grad.unsqueeze(0), dim=-1, eps=eps
+            )
+            # Average cosine similarity across visible views per Gaussian
+            cos_sim = cos_sim * mean_weights
+            chunk_agreement = cos_sim.sum(dim=0) / visible_counts.clamp_min(1.0)
+            # Gaussians with no visible views get agreement = 0
+            chunk_agreement = torch.where(visible_counts > 0, chunk_agreement, torch.zeros_like(chunk_agreement))
+            agreement[start:end] = chunk_agreement.cpu()
+
+        return agreement
 
     def _aggregate_gaussian_consensus_group(
         self,
@@ -665,6 +734,21 @@ class Trainer:
         for _ in range(config.gaussian_consensus_num_views):
             yield datamanager.next_train(step)
 
+    def _accumulate_agreement_scores(
+        self,
+        group_name: str,
+        agreement: torch.Tensor,
+    ) -> None:
+        """Add per-Gaussian agreement scores to running accumulators on the model."""
+        model = self.pipeline.model
+        if not hasattr(model, "_agreement_sum"):
+            return
+        if group_name not in model._agreement_sum:
+            return
+        active = agreement > 0
+        model._agreement_sum[group_name] += agreement
+        model._agreement_count[group_name] += active.float()
+
     @profiler.time_function
     def gaussian_consensus_train_iteration(self, step: int) -> TRAIN_INTERATION_OUTPUT:
         config = self._get_gaussian_consensus_config()
@@ -674,8 +758,21 @@ class Trainer:
         if config.gaussian_consensus_num_views < 1:
             raise RuntimeError("gaussian_consensus_num_views must be at least 1.")
 
+        model = self.pipeline.model
+        store_agreement = getattr(config, "store_agreement_scores", False) and hasattr(model, "_agreement_sum")
+
         trainable_groups = self._get_gaussian_consensus_param_groups()
-        view_grads: Dict[str, List[torch.Tensor]] = {group: [] for group in trainable_groups}
+
+        # Determine which groups need gradient collection
+        geometry_groups = ("means", "scales", "quats", "opacities")
+        if store_agreement:
+            diagnostic_groups = [g for g in geometry_groups if g in self.optimizers.parameters and g not in trainable_groups]
+            grad_groups = list(trainable_groups) + diagnostic_groups
+        else:
+            diagnostic_groups = []
+            grad_groups = list(trainable_groups)
+
+        view_grads: Dict[str, List[torch.Tensor]] = {group: [] for group in grad_groups}
         loss_dicts: List[Dict[str, torch.Tensor]] = []
         metrics_dicts: List[Dict[str, torch.Tensor]] = []
         losses: List[torch.Tensor] = []
@@ -683,16 +780,16 @@ class Trainer:
         cpu_or_cuda_str = "cpu" if cpu_or_cuda_str == "mps" else cpu_or_cuda_str
 
         self.optimizers.zero_grad_all()
-        with self._only_consensus_groups_require_grad(trainable_groups):
+        with self._only_consensus_groups_require_grad(grad_groups):
             for ray_bundle, batch in self._iter_gaussian_consensus_train_views(step, config):
                 with torch.autocast(device_type=cpu_or_cuda_str, enabled=self.mixed_precision):
                     model_outputs = self.pipeline._model(ray_bundle)
-                    metrics_dict = self.pipeline.model.get_metrics_dict(model_outputs, batch)
-                    loss_dict = self.pipeline.model.get_loss_dict(model_outputs, batch, metrics_dict)
+                    metrics_dict = model.get_metrics_dict(model_outputs, batch)
+                    loss_dict = model.get_loss_dict(model_outputs, batch, metrics_dict)
                     loss = functools.reduce(torch.add, loss_dict.values())
 
                 self.grad_scaler.scale(loss).backward()  # type: ignore
-                for group in trainable_groups:
+                for group in grad_groups:
                     param = self.optimizers.parameters[group][0]
                     grad = param.grad
                     if grad is None:
@@ -709,12 +806,35 @@ class Trainer:
                 self.optimizers.zero_grad_all()
                 del model_outputs, loss_dict, metrics_dict, loss, ray_bundle, batch
 
+        # Aggregate consensus gradients for trainable groups
         consensus_stats: Dict[str, torch.Tensor] = {}
         for group in trainable_groups:
             param = self.optimizers.parameters[group][0]
             consensus_grad, stats = self._aggregate_gaussian_consensus_group(group, param, view_grads[group], config)
             param.grad = consensus_grad
             consensus_stats.update(stats)
+
+        # Compute and accumulate agreement scores
+        if store_agreement and len(view_grads[trainable_groups[0]]) > 1:
+            for group in trainable_groups:
+                param = self.optimizers.parameters[group][0]
+                agreement = self._compute_consensus_agreement(view_grads[group], param, config)
+                self._accumulate_agreement_scores(group, agreement)
+
+            # Diagnostic geometry groups: compute agreement, average into single "geometry" score
+            if diagnostic_groups:
+                geo_agreements = []
+                for group in diagnostic_groups:
+                    param = self.optimizers.parameters[group][0]
+                    agreement = self._compute_consensus_agreement(view_grads[group], param, config)
+                    geo_agreements.append(agreement)
+                geo_mean = torch.stack(geo_agreements).mean(dim=0)
+                self._accumulate_agreement_scores("geometry", geo_mean)
+
+            # Clear diagnostic gradients so they don't affect the optimizer step
+            for group in diagnostic_groups:
+                param = self.optimizers.parameters[group][0]
+                param.grad = None
 
         needs_step = [
             group
