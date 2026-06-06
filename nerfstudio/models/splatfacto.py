@@ -264,15 +264,6 @@ class SplatfactoModel(Model):
             }
         )
 
-        # Agreement score accumulators for heatmap visualization
-        if self.config.store_agreement_scores:
-            num_pts = means.shape[0]
-            self._agreement_sum: Dict[str, torch.Tensor] = {}
-            self._agreement_count: Dict[str, torch.Tensor] = {}
-            for group in ("features_dc", "features_rest", "geometry"):
-                self._agreement_sum[group] = torch.zeros(num_pts)
-                self._agreement_count[group] = torch.zeros(num_pts)
-
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )

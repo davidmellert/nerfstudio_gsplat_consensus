@@ -207,6 +207,7 @@ class Trainer:
 
         self._load_checkpoint()
         self._save_dc_regularization_anchor()
+        self._init_agreement_accumulators()
 
         self.callbacks = self.pipeline.get_training_callbacks(
             TrainingCallbackAttributes(
@@ -510,6 +511,23 @@ class Trainer:
         out_path = self.checkpoint_dir / "agreement_scores.pt"
         torch.save(agreement_data, out_path)
         CONSOLE.log(f"[bold green]Saved agreement scores to {out_path}")
+
+    def _init_agreement_accumulators(self) -> None:
+        """Initialize agreement score accumulators after checkpoint is loaded (correct Gaussian count)."""
+        model = self.pipeline.model
+        model_config = getattr(model, "config", None)
+        if model_config is None or not getattr(model_config, "store_agreement_scores", False):
+            return
+        gauss_params = getattr(model, "gauss_params", None)
+        if gauss_params is None or "features_dc" not in gauss_params:
+            return
+        num_gaussians = gauss_params["features_dc"].shape[0]
+        model._agreement_sum = {}
+        model._agreement_count = {}
+        for group in ("features_dc", "features_rest", "geometry"):
+            model._agreement_sum[group] = torch.zeros(num_gaussians)
+            model._agreement_count[group] = torch.zeros(num_gaussians)
+        CONSOLE.log(f"[bold green]Initialized agreement accumulators for {num_gaussians} Gaussians.")
 
     def _save_dc_regularization_anchor(self) -> None:
         """Snapshot features_dc before fine-tuning so the DC regularizer has an anchor."""
