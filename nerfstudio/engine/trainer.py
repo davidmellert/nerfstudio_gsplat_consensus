@@ -40,6 +40,7 @@ from rich.panel import Panel
 from rich.table import Table
 from torch.cuda.amp.grad_scaler import GradScaler
 
+from nerfstudio.configs.evaluation_config import EditEvaluationConfig
 from nerfstudio.configs.experiment_config import ExperimentConfig
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
@@ -96,6 +97,8 @@ class TrainerConfig(ExperimentConfig):
     """Whether to start the training in a paused state."""
     downscale_factor: Optional[int] = None
     """Override the dataparser image downscale factor, e.g. 8 to use/create images_8."""
+    evaluation: EditEvaluationConfig = field(default_factory=EditEvaluationConfig)
+    """Optional post-training edit evaluation configuration."""
 
 
 class Trainer:

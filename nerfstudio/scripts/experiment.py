@@ -58,6 +58,7 @@ RESERVED_RUN_KEYS = {
     "datamanager",
     "dataparser",
     "defaults",
+    "evaluation",
     "logging",
     "machine",
     "method",
@@ -128,6 +129,21 @@ def _apply_object_overrides(target: Any, values: Mapping[str, Any]) -> None:
         setattr(target, key, _coerce_value(key, value, getattr(target, key)))
 
 
+def _is_dataclass_instance(value: Any) -> bool:
+    return dataclasses.is_dataclass(value) and not isinstance(value, type)
+
+
+def _apply_dataclass_overrides(target: Any, values: Mapping[str, Any]) -> None:
+    for key, value in values.items():
+        if not hasattr(target, key):
+            raise ValueError(f"{type(target).__name__} has no field '{key}'")
+        current = getattr(target, key)
+        if isinstance(value, Mapping) and _is_dataclass_instance(current):
+            _apply_dataclass_overrides(current, value)
+        else:
+            setattr(target, key, _coerce_value(key, value, current))
+
+
 def _set_dotted(target: Any, dotted_key: str, value: Any) -> None:
     obj = target
     parts = dotted_key.split(".")
@@ -177,6 +193,10 @@ def _load_base_config(run_spec: Mapping[str, Any]) -> TrainerConfig:
         if not isinstance(config, TrainerConfig):
             raise ValueError(f"base_config must contain a TrainerConfig, got {type(config).__name__}")
         config = copy.deepcopy(config)
+        if not hasattr(config, "evaluation"):
+            from nerfstudio.configs.evaluation_config import EditEvaluationConfig
+
+            config.evaluation = EditEvaluationConfig()
         config.load_config = None
         config.timestamp = "{timestamp}"
         return config
@@ -244,6 +264,22 @@ def _normalize_consensus_mode(value: Any) -> str:
     if key in ("batch", "sequential_batch"):
         return "batch"
     raise ValueError("consensus.mode must be one of standard, consensus, online, or batch")
+
+
+def _apply_evaluation(config: TrainerConfig, run_spec: Mapping[str, Any]) -> None:
+    evaluation_spec = run_spec.get("evaluation")
+    if evaluation_spec is None:
+        return
+    if not isinstance(evaluation_spec, Mapping):
+        raise ValueError("evaluation must be a mapping")
+    _apply_dataclass_overrides(config.evaluation, evaluation_spec)
+    from nerfstudio.evaluation.edit_metrics import normalize_metrics
+
+    config.evaluation.metrics = normalize_metrics(config.evaluation.metrics)
+    reference = config.evaluation.reference
+    if config.evaluation.enabled and reference.load_checkpoint is None and reference.load_dir is None and config.load_dir is not None:
+        reference.load_dir = config.load_dir
+        reference.load_step = config.load_step
 
 
 def _apply_consensus(config: TrainerConfig, run_spec: Mapping[str, Any]) -> None:
@@ -340,6 +376,7 @@ def _apply_consensus(config: TrainerConfig, run_spec: Mapping[str, Any]) -> None
 def _build_trainer_config(run_spec: Mapping[str, Any], suite_name: Optional[str], run_name: str) -> TrainerConfig:
     config = _load_base_config(run_spec)
     _apply_common_overrides(config, run_spec)
+    _apply_evaluation(config, run_spec)
     _apply_consensus(config, run_spec)
 
     if suite_name and "experiment_name" not in run_spec:
@@ -428,10 +465,35 @@ def _run_render(
     return output_path
 
 
-def _write_run_manifest(base_dir: Path, run_spec: Mapping[str, Any], render_path: Optional[Path]) -> None:
+def _evaluation_output_dir(config: TrainerConfig) -> Path:
+    output_dir = _as_path(config.evaluation.output_dir)
+    return output_dir if output_dir.is_absolute() else config.get_base_dir() / output_dir
+
+
+def _run_evaluation(config_path: Path, config: TrainerConfig, run_name: str) -> Optional[Path]:
+    if not config.evaluation.enabled:
+        return None
+    from nerfstudio.evaluation.edit_metrics import evaluate_edit_metrics
+
+    CONSOLE.rule(f"Evaluation {run_name}")
+    return evaluate_edit_metrics(config_path)
+
+
+def _log_evaluation_plan(config: TrainerConfig) -> None:
+    if config.evaluation.enabled:
+        metrics = ", ".join(config.evaluation.metrics)
+        CONSOLE.log(f"Evaluation metrics: {metrics}")
+        CONSOLE.log(f"Evaluation output: {_evaluation_output_dir(config)}")
+
+
+def _write_run_manifest(
+    base_dir: Path, run_spec: Mapping[str, Any], render_path: Optional[Path], evaluation_path: Optional[Path]
+) -> None:
     manifest = {"run": dict(run_spec)}
     if render_path is not None:
         manifest["render_path"] = str(render_path)
+    if evaluation_path is not None:
+        manifest["evaluation_path"] = str(evaluation_path)
     (base_dir / "experiment_run.yml").write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
 
 
@@ -469,9 +531,14 @@ class ExperimentCommand:
             config = _build_trainer_config(run_spec, suite_name, run_name)
             config_path = _prepare_training_config(config) if self.dry_run or self.skip_train else _run_training(config)
             render_path = None
+            evaluation_path = None
+            if self.dry_run:
+                _log_evaluation_plan(config)
             if not self.skip_render and not self.dry_run:
                 render_path = _run_render(run_spec.get("render", {}) or {}, config_path, config, suite_name, run_name)
-            _write_run_manifest(config.get_base_dir(), run_spec, render_path)
+            if not self.dry_run:
+                evaluation_path = _run_evaluation(config_path, config, run_name)
+            _write_run_manifest(config.get_base_dir(), run_spec, render_path, evaluation_path)
             if self.dry_run:
                 CONSOLE.log(f"Dry run prepared config: {config_path}")
 

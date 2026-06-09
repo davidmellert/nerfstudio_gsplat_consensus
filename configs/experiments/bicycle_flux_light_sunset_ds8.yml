@@ -49,6 +49,28 @@ defaults:
     output_dir: renders
     output_format: video
     rendered_output_names: [rgb]
+  evaluation:
+    enabled: false
+    output_dir: evaluations
+    metrics:
+      - reconstruction
+      - clip_text
+      - clip_direction
+      - clip_image
+      - clip_direction_consistency
+      - gaussian_coverage
+      - gaussian_delta
+      - gaussian_scene
+    save_per_image: true
+    save_rendered_images: false
+    clip:
+      prompt: "a photo of a bicycle at sunset"
+      source_prompt: "a photo of a bicycle"
+      model: ViT-L/14
+      neighbor_count: 1
+    reference:
+      load_dir: outputs/bicycle_ns/splatfacto-colmap/2026-05-27_221222/nerfstudio_models
+      load_step: 14999
 
 runs:
   - name: standard-1view-all-no-densify-flux_light_sunset-ds8
