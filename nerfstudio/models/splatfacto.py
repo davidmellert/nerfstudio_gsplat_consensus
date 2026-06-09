@@ -177,7 +177,7 @@ class SplatfactoModelConfig(ModelConfig):
     """Number of edited training views to render before one optimizer step."""
     gaussian_consensus_max_views_per_gaussian: int = 0
     """Maximum visible views that can influence one Gaussian per step. If 0, use all visible views."""
-    gaussian_consensus_view_sampling: Literal["global", "pose_neighborhood"] = "pose_neighborhood"
+    gaussian_consensus_view_sampling: Literal["global", "pose_neighborhood", "lookat_twostage"] = "pose_neighborhood"
     """How to sample the edited views used in one consensus optimizer step."""
     gaussian_consensus_neighbor_pool_size: int = 16
     """Number of nearest edited train views to sample extra consensus views from."""
@@ -697,7 +697,10 @@ class SplatfactoModel(Model):
 
         eps = self.config.gaussian_consensus_eps
 
+        alpha_map = None
+
         def rasterize_colors(colors: torch.Tensor) -> torch.Tensor:
+            nonlocal alpha_map
             render, alpha, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
                 means=means,
                 quats=quats,
@@ -717,10 +720,13 @@ class SplatfactoModel(Model):
                 absgrad=False,
                 rasterize_mode=self.config.rasterize_mode,
             )
+            if alpha_map is None:
+                alpha_map = (alpha.squeeze(0) > eps).float()[..., :1]
+            nan_fill = torch.full_like(render, float("nan"))
             return torch.where(
                 alpha > eps,
                 render / alpha.clamp_min(eps),
-                torch.zeros_like(render),
+                nan_fill,
             ).squeeze(0)
 
         scalar_items: List[Tuple[str, torch.Tensor]] = []
@@ -743,6 +749,9 @@ class SplatfactoModel(Model):
             if value.shape[-1] != 3:
                 continue
             rendered_outputs[name] = rasterize_colors(value[:, :3])
+
+        if alpha_map is not None:
+            rendered_outputs["_alpha"] = alpha_map
 
         return rendered_outputs
 

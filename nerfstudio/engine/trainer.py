@@ -692,8 +692,11 @@ class Trainer:
         value = value.detach().cpu().float()
         if value.ndim == 2:
             value = value[..., None]
+        bg_mask = torch.isnan(value[..., 0])
         if "opacity_update" in name:
-            return Trainer._signed_array_to_rgb(value.numpy(), scale=signed_scale)
+            result = Trainer._signed_array_to_rgb(value.numpy(), scale=signed_scale)
+            result[bg_mask.numpy()] = 0.5
+            return result
         normalize = name not in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}
         if value_range is not None:
             min_value, max_value = value_range
@@ -701,15 +704,24 @@ class Trainer:
             value = torch.nan_to_num(value, nan=0.0, posinf=float(max_value), neginf=float(min_value))
             value = torch.clamp((value - float(min_value)) / denominator, 0.0, 1.0)
             normalize = False
+        else:
+            value = torch.nan_to_num(value, nan=0.0)
         options = colormaps.ColormapOptions(colormap="turbo", normalize=normalize)
-        return colormaps.apply_colormap(value, colormap_options=options).cpu().numpy()
+        result = colormaps.apply_colormap(value, colormap_options=options).cpu().numpy()
+        result[bg_mask.numpy()] = 0.5
+        return result
 
     @staticmethod
     def _rgb_tensor_to_panel_image(name: str, value: torch.Tensor, signed_scale: Optional[float] = None) -> np.ndarray:
         array = value.detach().cpu().float().numpy()
+        bg_mask = np.isnan(array[..., 0])
         if "update" in name:
-            return Trainer._signed_array_to_rgb(array, scale=signed_scale)
-        return np.clip(array, 0.0, 1.0)
+            result = Trainer._signed_array_to_rgb(np.nan_to_num(array, nan=0.0), scale=signed_scale)
+            result[bg_mask] = 0.5
+            return result
+        result = np.clip(np.nan_to_num(array, nan=0.0), 0.0, 1.0)
+        result[bg_mask] = 0.5
+        return result
 
     @staticmethod
     def _write_png(path: Path, image: np.ndarray) -> None:
@@ -915,6 +927,10 @@ class Trainer:
         opacity_signed_scale = max(opacity_signed_scale, 1e-8)
         max_view_index = max(1, len(view_records) - 1)
         max_visible_count = max(1, len(view_records))
+
+        alpha_map = rendered_maps.pop("_alpha", None)
+        if alpha_map is not None:
+            npz_arrays["map___alpha"] = self._tensor_to_npz_array(alpha_map)
 
         for name, value in rendered_maps.items():
             npz_arrays[f"map__{name}"] = self._tensor_to_npz_array(value)
