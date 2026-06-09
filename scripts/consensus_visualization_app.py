@@ -178,7 +178,10 @@ def _static_scale_for_map(name: str, arrays: Sequence[np.ndarray]) -> Tuple[Opti
         return None, None
     values = np.concatenate(finite_values)
 
-    if name in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}:
+    if name in {"agreement", "disagreement"}:
+        upper = float(np.max(values)) if values.size else 1.0
+        return (0.0, max(upper, 1e-8)), None
+    if name in {"dominance_strength", "suppression_ratio"}:
         return (0.0, 1.0), None
     if name in {"dominant_view", "visible_view_count"}:
         return (0.0, max(1.0, float(np.max(values)))), None

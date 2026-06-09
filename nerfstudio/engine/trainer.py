@@ -944,7 +944,12 @@ class Trainer:
             if self._is_update_norm_map(name):
                 scalar_range = (0.0, norm_scale_max)
                 panel_scales[name] = self._scale_record("linear", 0.0, norm_scale_max)
-            elif name in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}:
+            elif name in {"agreement", "disagreement"}:
+                finite_vals = value[torch.isfinite(value)]
+                upper = max(float(finite_vals.max()) if finite_vals.numel() > 0 else 1.0, 1e-8)
+                scalar_range = (0.0, upper)
+                panel_scales[name] = self._scale_record("linear", 0.0, upper)
+            elif name in {"dominance_strength", "suppression_ratio"}:
                 scalar_range = (0.0, 1.0)
                 panel_scales[name] = self._scale_record("linear", 0.0, 1.0)
             elif name == "visible_view_count":
