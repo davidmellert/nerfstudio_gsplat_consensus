@@ -54,7 +54,7 @@ def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Pat
                 justify="center",
             )
             sys.exit(1)
-        load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(config.load_dir))[-1]
+        load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(config.load_dir) if x.endswith(".ckpt"))[-1]
     else:
         load_step = config.load_step
     load_path = config.load_dir / f"step-{load_step:09d}.ckpt"
