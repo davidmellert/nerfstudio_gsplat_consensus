@@ -882,9 +882,14 @@ class Trainer:
         if len(per_gaussian) == 0:
             return
 
+        active_mask = per_gaussian.get("visible_counts", None)
+        if active_mask is not None:
+            active_mask = (active_mask > 0)
+
         anchor_camera = view_records[0]["camera"]
         rendered_maps = self.pipeline.model.render_gaussian_attribute_maps_for_camera(
-            anchor_camera, scalar_attributes=scalar_attributes, rgb_attributes=rgb_attributes
+            anchor_camera, scalar_attributes=scalar_attributes, rgb_attributes=rgb_attributes,
+            active_mask=active_mask,
         )
 
         output_root = self.base_dir / str(getattr(config, "gaussian_consensus_visualization_output_dir", "consensus_visualizations"))

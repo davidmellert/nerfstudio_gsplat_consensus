@@ -690,12 +690,18 @@ class SplatfactoModel(Model):
         H: int,
         scalar_attributes: Dict[str, torch.Tensor],
         rgb_attributes: Dict[str, torch.Tensor],
+        active_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         rendered_outputs: Dict[str, torch.Tensor] = {}
         if means.shape[0] == 0:
             return rendered_outputs
 
         eps = self.config.gaussian_consensus_eps
+
+        if active_mask is not None:
+            active_mask = active_mask.to(device=opacities.device)
+            opacities = opacities.clone()
+            opacities[~active_mask] = -1e10  # sigmoid(-1e10) ≈ 0
 
         alpha_map = None
 
@@ -761,6 +767,7 @@ class SplatfactoModel(Model):
         camera: Cameras,
         scalar_attributes: Dict[str, torch.Tensor],
         rgb_attributes: Dict[str, torch.Tensor],
+        active_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Render arbitrary per-Gaussian attributes into one camera for offline diagnostics."""
         if not isinstance(camera, Cameras) or self.num_points == 0:
@@ -789,6 +796,8 @@ class SplatfactoModel(Model):
             rgb_attributes = {
                 name: value[crop_ids] for name, value in rgb_attributes.items() if value.shape[0] == self.num_points
             }
+            if active_mask is not None and active_mask.shape[0] == self.num_points:
+                active_mask = active_mask[crop_ids]
         else:
             means = self.means
             quats = self.quats
@@ -813,6 +822,7 @@ class SplatfactoModel(Model):
             H=H,
             scalar_attributes=scalar_attributes,
             rgb_attributes=rgb_attributes,
+            active_mask=active_mask,
         )
 
     @torch.no_grad()
