@@ -809,6 +809,14 @@ class Trainer:
             if image is not None:
                 norm_row.append((label, image))
 
+        cosine_row: List[Tuple[str, np.ndarray]] = []
+        for view_idx in range(num_views):
+            name = f"view_cosine_sim_{view_idx:02d}"
+            image = get_panel(name)
+            if image is not None:
+                label = "anchor" if view_idx == 0 else f"ref {view_idx}"
+                cosine_row.append((f"cos {label}", image))
+
         agreement_row: List[Tuple[str, np.ndarray]] = []
         for label, name in (
             ("visible views", "visible_view_count"),
@@ -835,7 +843,7 @@ class Trainer:
             if image is not None:
                 direction_row.append((label, image))
 
-        dashboard_rows = [row for row in (input_row, norm_row, agreement_row, direction_row) if len(row) > 0]
+        dashboard_rows = [row for row in (input_row, norm_row, cosine_row, agreement_row, direction_row) if len(row) > 0]
         Trainer._write_dashboard(step_dir / "preview_dashboard.png", dashboard_rows)
 
     @staticmethod
@@ -946,9 +954,18 @@ class Trainer:
                 panel_scales[name] = self._scale_record("linear", 0.0, norm_scale_max)
             elif name in {"agreement", "disagreement"}:
                 finite_vals = value[torch.isfinite(value)]
-                upper = max(float(finite_vals.max()) if finite_vals.numel() > 0 else 1.0, 1e-8)
-                scalar_range = (0.0, upper)
-                panel_scales[name] = self._scale_record("linear", 0.0, upper)
+                lower = float(finite_vals.min()) if finite_vals.numel() > 0 else 0.0
+                upper = float(finite_vals.max()) if finite_vals.numel() > 0 else 1.0
+                upper = max(upper, lower + 1e-8)
+                scalar_range = (lower, upper)
+                panel_scales[name] = self._scale_record("linear", lower, upper)
+            elif "cosine_sim" in name:
+                finite_vals = value[torch.isfinite(value)]
+                lower = float(finite_vals.min()) if finite_vals.numel() > 0 else -1.0
+                upper = float(finite_vals.max()) if finite_vals.numel() > 0 else 1.0
+                upper = max(upper, lower + 1e-8)
+                scalar_range = (lower, upper)
+                panel_scales[name] = self._scale_record("linear", lower, upper)
             elif name in {"dominance_strength", "suppression_ratio"}:
                 scalar_range = (0.0, 1.0)
                 panel_scales[name] = self._scale_record("linear", 0.0, 1.0)

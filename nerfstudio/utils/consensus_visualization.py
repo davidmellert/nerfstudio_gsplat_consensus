@@ -82,6 +82,8 @@ def compute_consensus_visualization_data(
 
     mean_update_norm_sq = torch.zeros(num_gaussians, device=device, dtype=dtype)
     final_update_norm_sq = torch.zeros(num_gaussians, device=device, dtype=dtype)
+    all_view_flats: List[torch.Tensor] = []
+    all_mean_flats: List[torch.Tensor] = []
     rgb_attributes: Dict[str, torch.Tensor] = {}
     scalar_attributes: Dict[str, torch.Tensor] = {
         f"view_update_norm_{view_idx:02d}": view_update_norm[view_idx] for view_idx in range(num_views)
@@ -101,6 +103,9 @@ def compute_consensus_visualization_data(
         mean_update = mean_flat.reshape_as(final_grads[group])
         mean_update_norm_sq += mean_flat.square().sum(dim=-1).to(dtype=dtype)
 
+        all_view_flats.append(flat_updates.to(dtype=dtype))
+        all_mean_flats.append(mean_flat.to(dtype=dtype))
+
         final_update = -float(learning_rates.get(group, 1.0)) * final_grads[group].detach()
         final_flat = final_update.reshape(num_gaussians, -1)
         final_update_norm_sq += final_flat.square().sum(dim=-1).to(dtype=dtype)
@@ -111,6 +116,15 @@ def compute_consensus_visualization_data(
         if group == "opacities":
             scalar_attributes["opacity_update_mean"] = mean_update.reshape(num_gaussians, -1)[:, 0]
             scalar_attributes["opacity_update_final"] = final_update.reshape(num_gaussians, -1)[:, 0]
+
+    combined_view_flat = torch.cat(all_view_flats, dim=-1)  # [V, N, D_total]
+    combined_mean_flat = torch.cat(all_mean_flats, dim=-1)  # [N, D_total]
+    view_cosine_sim = torch.nn.functional.cosine_similarity(
+        combined_view_flat, combined_mean_flat.unsqueeze(0), dim=-1, eps=eps,
+    )  # [V, N]
+    view_cosine_sim = torch.where(visible, view_cosine_sim, torch.zeros_like(view_cosine_sim))
+    for view_idx in range(num_views):
+        scalar_attributes[f"view_cosine_sim_{view_idx:02d}"] = view_cosine_sim[view_idx]
 
     expected_norm_sq = (total_view_norm_sq * visible_f).sum(dim=0)
     expected_norm_sq = expected_norm_sq / visible_counts.clamp_min(1.0)
@@ -142,6 +156,7 @@ def compute_consensus_visualization_data(
     )
     per_gaussian = {
         "view_update_norm": view_update_norm,
+        "view_cosine_sim": view_cosine_sim,
         "mean_update_norm": mean_update_norm,
         "final_update_norm": final_update_norm,
         "agreement": agreement,
