@@ -17,6 +17,7 @@ datamanager:
 
 versions_dir: /mnt/hdd/data/bicycle/images_sunset_versions_8
 num_versions: 3
+num_steps: 200
 
 views:
   - _DSC8685

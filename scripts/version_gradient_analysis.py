@@ -24,7 +24,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from nerfstudio.cameras.cameras import Cameras
@@ -95,16 +94,18 @@ def load_edited_image(image_path: Path, target_h: int, target_w: int) -> torch.T
     return torch.from_numpy(np.array(img)).float() / 255.0
 
 
-def run_single_step(
+def run_training_steps(
     pipeline: VanillaPipeline,
     camera: Cameras,
     target_image: torch.Tensor,
     trainable_groups: List[str],
     original_state: Dict[str, torch.Tensor],
+    learning_rates: Dict[str, float],
+    num_steps: int = 1,
 ) -> Dict[str, torch.Tensor]:
-    """Run one forward+backward pass and return per-group gradients.
+    """Run N gradient descent steps and return the final updated parameters.
 
-    Resets model to original_state before the step.
+    Resets model to original_state before training.
     """
     device = next(pipeline.model.parameters()).device
 
@@ -120,36 +121,42 @@ def run_single_step(
     for name, param in pipeline.model.gauss_params.items():
         param.requires_grad_(name in trainable_groups)
 
-    # Zero existing gradients
-    for name in trainable_groups:
-        param = pipeline.model.gauss_params[name]
-        if param.grad is not None:
-            param.grad.zero_()
-
-    # Forward pass
-    pipeline.model.train()
     camera = camera.to(device)
-    model_outputs = pipeline.model(camera)
+    target = target_image.to(device)
 
-    # Build batch with target image
-    batch = {"image": target_image.to(device)}
-    metrics_dict = pipeline.model.get_metrics_dict(model_outputs, batch)
-    loss_dict = pipeline.model.get_loss_dict(model_outputs, batch, metrics_dict)
-    loss = functools.reduce(torch.add, loss_dict.values())
+    for step in range(num_steps):
+        # Zero existing gradients
+        for name in trainable_groups:
+            param = pipeline.model.gauss_params[name]
+            if param.grad is not None:
+                param.grad.zero_()
 
-    # Backward
-    loss.backward()
+        # Forward pass
+        pipeline.model.train()
+        model_outputs = pipeline.model(camera)
 
-    # Collect gradients
-    grads = {}
+        # Build batch with target image
+        batch = {"image": target}
+        metrics_dict = pipeline.model.get_metrics_dict(model_outputs, batch)
+        loss_dict = pipeline.model.get_loss_dict(model_outputs, batch, metrics_dict)
+        loss = functools.reduce(torch.add, loss_dict.values())
+
+        # Backward
+        loss.backward()
+
+        # Manual SGD update
+        with torch.no_grad():
+            for name in trainable_groups:
+                param = pipeline.model.gauss_params[name]
+                if param.grad is not None:
+                    param.add_(param.grad, alpha=-learning_rates[name])
+
+    # Collect final updated parameters
+    updated = {}
     for name in trainable_groups:
-        param = pipeline.model.gauss_params[name]
-        if param.grad is not None:
-            grads[name] = param.grad.detach().clone()
-        else:
-            grads[name] = torch.zeros_like(param)
+        updated[name] = pipeline.model.gauss_params[name].detach().clone()
 
-    return grads
+    return updated
 
 
 def apply_update_and_render(
@@ -182,8 +189,11 @@ def render_attribute_map(
     attribute: torch.Tensor,
     original_state: Dict[str, torch.Tensor],
     active_mask: Optional[torch.Tensor] = None,
-) -> np.ndarray:
-    """Render a per-Gaussian scalar attribute as a colormap image."""
+) -> Tuple[np.ndarray, float, float]:
+    """Render a per-Gaussian scalar attribute as a colormap image.
+
+    Returns (image, lower, upper) where lower/upper are the data range used for scaling.
+    """
     device = next(pipeline.model.parameters()).device
 
     # Reset to original state for geometry
@@ -202,10 +212,10 @@ def render_attribute_map(
         )
 
     if "value" not in rendered:
-        return np.zeros((int(camera.height.item()), int(camera.width.item()), 3))
+        h, w = int(camera.height.item()), int(camera.width.item())
+        return np.zeros((h, w, 3)), 0.0, 1.0
 
     value = rendered["value"].cpu()
-    # Remove alpha map if present
     rendered.pop("_alpha", None)
 
     finite = value[torch.isfinite(value)]
@@ -222,41 +232,124 @@ def render_attribute_map(
     options = colormaps.ColormapOptions(colormap="turbo", normalize=False)
     result = colormaps.apply_colormap(value, colormap_options=options).cpu().numpy()
     result[bg_mask.numpy()] = 0.5
-    return result
+    return result, lower, upper
 
 
-def build_dashboard(rows: List[List[Tuple[str, np.ndarray]]], output_path: Path) -> None:
-    """Build a dashboard PNG from rows of labeled images."""
+def add_colorbar(image: np.ndarray, lower: float, upper: float, bar_width: int = 30) -> np.ndarray:
+    """Add a vertical colorbar to the right side of an image."""
+    from PIL import ImageDraw, ImageFont
+
+    h, w = image.shape[:2]
+    # Create colorbar gradient (turbo colormap, vertical)
+    gradient = torch.linspace(1, 0, h).unsqueeze(-1)  # top=high, bottom=low
+    options = colormaps.ColormapOptions(colormap="turbo", normalize=False)
+    bar = colormaps.apply_colormap(gradient, colormap_options=options).numpy()  # [H, 1, 3]
+    bar = np.repeat(bar, bar_width, axis=1)  # [H, bar_width, 3]
+
+    # Combine image + bar + label area
+    label_width = bar_width * 3
+    combined = np.ones((h, w + bar_width + label_width, 3), dtype=np.float32) * 0.15
+    combined[:, :w] = image
+    combined[:, w:w + bar_width] = bar
+
+    # Draw tick labels
+    pil_img = Image.fromarray((np.clip(combined, 0, 1) * 255).astype(np.uint8))
+    draw = ImageDraw.Draw(pil_img)
+    font_size = max(10, min(h // 30, 24))
+    font = None
+    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/System/Library/Fonts/Helvetica.ttc"]:
+        try:
+            font = ImageFont.truetype(fp, font_size)
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    x_label = w + bar_width + 4
+    # Format values compactly
+    def fmt(v: float) -> str:
+        if abs(v) < 1e-3 or abs(v) > 1e4:
+            return f"{v:.1e}"
+        return f"{v:.4f}"
+
+    draw.text((x_label, 2), fmt(upper), fill=(220, 220, 220), font=font)
+    mid_y = h // 2 - font_size // 2
+    draw.text((x_label, mid_y), fmt((lower + upper) / 2), fill=(220, 220, 220), font=font)
+    draw.text((x_label, h - font_size - 4), fmt(lower), fill=(220, 220, 220), font=font)
+
+    return np.array(pil_img).astype(np.float32) / 255.0
+
+
+def build_dashboard(
+    rows: List[List[Tuple[str, np.ndarray]]],
+    output_path: Path,
+    row_titles: Optional[List[str]] = None,
+) -> None:
+    """Build a dashboard PNG from rows of labeled images.
+
+    Args:
+        rows: List of rows, each row is a list of (label, image) tuples.
+        output_path: Where to save the dashboard PNG.
+        row_titles: Optional titles for each row (shown on the left side).
+    """
     from PIL import ImageDraw, ImageFont
 
     if not rows:
         return
 
-    label_height = 20
-    padding = 4
-    # Find consistent cell size from the first image
-    ref_img = rows[0][0][1]
-    cell_h, cell_w = ref_img.shape[:2]
+    # Find max cell size across all images
+    cell_h = max(img.shape[0] for row in rows for _, img in row)
+    cell_w = max(img.shape[1] for row in rows for _, img in row)
+
+    # Scale font size relative to image size
+    font_size = max(16, min(cell_h // 20, 48))
+    label_height = font_size + 10
+    padding = 6
+    row_title_width = font_size * 10 if row_titles else 0
+
+    # Try to load a good font at the right size
+    font = None
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNSMono.ttf",
+    ]
+    for fp in font_paths:
+        try:
+            font = ImageFont.truetype(fp, font_size)
+            break
+        except (OSError, IOError):
+            continue
+    if font is None:
+        font = ImageFont.load_default()
 
     max_cols = max(len(row) for row in rows)
-    total_w = max_cols * (cell_w + padding) - padding
+    total_w = row_title_width + max_cols * (cell_w + padding) - padding
     total_h = len(rows) * (cell_h + label_height + padding) - padding
 
     canvas = np.ones((total_h, total_w, 3), dtype=np.float32) * 0.15
     pil_canvas = Image.fromarray((canvas * 255).astype(np.uint8))
     draw = ImageDraw.Draw(pil_canvas)
 
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-    except (OSError, IOError):
-        font = ImageFont.load_default()
-
     for row_idx, row in enumerate(rows):
         y_offset = row_idx * (cell_h + label_height + padding)
+
+        # Draw row title on the left
+        if row_titles and row_idx < len(row_titles):
+            title_y = y_offset + label_height + cell_h // 2 - font_size // 2
+            draw.text((4, title_y), row_titles[row_idx], fill=(200, 200, 200), font=font)
+
         for col_idx, (label, img) in enumerate(row):
-            x_offset = col_idx * (cell_w + padding)
-            # Draw label
-            draw.text((x_offset + 2, y_offset + 2), label, fill=(255, 255, 255), font=font)
+            x_offset = row_title_width + col_idx * (cell_w + padding)
+            # Draw label above image
+            draw.text(
+                (x_offset + 4, y_offset + 2),
+                label,
+                fill=(255, 255, 255),
+                font=font,
+            )
             # Paste image
             img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
             pil_img = Image.fromarray(img_uint8)
@@ -295,12 +388,14 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=None, help="Override output directory")
     parser.add_argument("--trainable", type=str, nargs="+", default=None)
     parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--num-steps", type=int, default=None, help="Number of gradient steps per version")
     cli_args = parser.parse_args()
 
     cfg = load_yaml_config(cli_args.config)
     output_dir = cli_args.output_dir or Path(cfg.get("output_dir", "outputs/version_analysis"))
     trainable = cli_args.trainable or cfg.get("trainable", ["features_dc", "features_rest", "opacities"])
     lr_override = cli_args.lr or cfg.get("lr", None)
+    num_steps = cli_args.num_steps or cfg.get("num_steps", 100)
     num_versions = cfg.get("num_versions", 3)
     versions_dir = Path(cfg["versions_dir"]) if "versions_dir" in cfg else None
 
@@ -337,6 +432,7 @@ def main():
             output_dir=output_dir,
             trainable=trainable,
             lr=lr_override,
+            num_steps=num_steps,
         )
         _run_analysis(pipeline, original_state, device, args)
 
@@ -374,8 +470,10 @@ def _run_analysis(pipeline, original_state, device, args):
     num_gaussians = pipeline.model.num_points
     print(f"Analyzing {num_versions} versions, {num_gaussians} Gaussians")
 
-    # Per-version: compute gradients and updated params
-    all_grads: List[Dict[str, torch.Tensor]] = []
+    num_steps = args.num_steps
+    print(f"Training steps per version: {num_steps}")
+
+    # Per-version: run N training steps and collect final params
     all_updated_params: List[Dict[str, torch.Tensor]] = []
     version_target_images: List[np.ndarray] = []
 
@@ -384,14 +482,10 @@ def _run_analysis(pipeline, original_state, device, args):
         target_image = load_edited_image(version_path, h, w)
         version_target_images.append(target_image.numpy())
 
-        grads = run_single_step(pipeline, camera, target_image, args.trainable, original_state)
-        all_grads.append(grads)
-
-        # Compute updated params: param - lr * grad
-        updated = {}
-        for group in args.trainable:
-            lr = learning_rates[group]
-            updated[group] = original_state[group].to(device) - lr * grads[group].to(device)
+        updated = run_training_steps(
+            pipeline, camera, target_image, args.trainable,
+            original_state, learning_rates, num_steps=num_steps,
+        )
         all_updated_params.append(updated)
 
     # Render per-version results
@@ -420,78 +514,51 @@ def _run_analysis(pipeline, original_state, device, args):
     # Total variance across all groups
     total_var = sum(variance_maps.values())
 
-    # Active mask: Gaussians that got any gradient
-    combined_grad_norm = torch.zeros(num_gaussians, device=device)
-    for grads in all_grads:
+    # Active mask: Gaussians that changed in any version
+    combined_delta_norm = torch.zeros(num_gaussians, device=device)
+    for updated in all_updated_params:
         for group in args.trainable:
-            flat = grads[group].to(device).reshape(num_gaussians, -1).float()
-            combined_grad_norm += flat.norm(dim=-1)
-    active_mask = combined_grad_norm > 1e-8
+            delta = (updated[group].to(device) - original_state[group].to(device)).reshape(num_gaussians, -1).float()
+            combined_delta_norm += delta.norm(dim=-1)
+    active_mask = combined_delta_norm > 1e-8
 
     print(f"Active Gaussians: {active_mask.sum().item()}/{num_gaussians}")
 
-    # Render variance maps
+    # Render variance maps (with colorbar)
     rendered_var_maps = {}
     for group, var_tensor in variance_maps.items():
-        rendered_var_maps[group] = render_attribute_map(
+        img, lo, hi = render_attribute_map(
             pipeline, camera, var_tensor, original_state, active_mask=active_mask
         )
-    rendered_var_maps["total"] = render_attribute_map(
+        rendered_var_maps[group] = add_colorbar(img, lo, hi)
+    img, lo, hi = render_attribute_map(
         pipeline, camera, total_var, original_state, active_mask=active_mask
     )
-
-    # Render cosine similarity between each version's gradient and the mean gradient
-    # Combined across all groups
-    all_flat_grads = []
-    for grads in all_grads:
-        parts = []
-        for group in args.trainable:
-            lr = learning_rates[group]
-            update = (-lr * grads[group].to(device)).reshape(num_gaussians, -1).float()
-            parts.append(update)
-        all_flat_grads.append(torch.cat(parts, dim=-1))  # [N, D_total]
-
-    stacked_grads = torch.stack(all_flat_grads, dim=0)  # [V, N, D_total]
-    mean_grad = stacked_grads.mean(dim=0)  # [N, D_total]
-    cosine_sims = []
-    for v_idx in range(num_versions):
-        cos = F.cosine_similarity(stacked_grads[v_idx], mean_grad, dim=-1, eps=1e-8)
-        cos = torch.where(active_mask, cos, torch.zeros_like(cos))
-        cosine_sims.append(cos)
-
-    rendered_cosine_maps = []
-    for v_idx, cos in enumerate(cosine_sims):
-        rendered_cosine_maps.append(
-            render_attribute_map(pipeline, camera, cos, original_state, active_mask=active_mask)
-        )
+    rendered_var_maps["total"] = add_colorbar(img, lo, hi)
 
     # Build dashboard
     # Row 1: Original + version input images
-    row1 = [("original", original_rgb)]
+    row1 = [("Original Render", original_rgb)]
     for v_idx, img in enumerate(version_target_images):
-        row1.append((f"version {v_idx}", img))
+        row1.append((f"Edit Version {v_idx}", img))
 
     # Row 2: Per-version rendered results + mean result
     row2 = []
     for v_idx, rgb in enumerate(version_renders):
-        row2.append((f"result v{v_idx}", rgb))
-    row2.append(("mean result", mean_render))
+        row2.append((f"After {num_steps} Steps (v{v_idx})", rgb))
+    row2.append(("Mean of All Versions", mean_render))
 
-    # Row 3: Cosine similarity per version
+    # Row 3: Variance maps
     row3 = []
-    for v_idx, cmap in enumerate(rendered_cosine_maps):
-        row3.append((f"cos sim v{v_idx}", cmap))
-
-    # Row 4: Variance maps
-    row4 = []
     for group in args.trainable:
         short = group.replace("features_", "")
-        row4.append((f"var {short}", rendered_var_maps[group]))
-    row4.append(("var total", rendered_var_maps["total"]))
+        row3.append((f"Variance: {short}", rendered_var_maps[group]))
+    row3.append(("Variance: Total", rendered_var_maps["total"]))
 
-    dashboard_rows = [row for row in [row1, row2, row3, row4] if row]
+    dashboard_rows = [row for row in [row1, row2, row3] if row]
+    row_titles = ["Inputs", "Renders", "Variance"]
     output_dir = args.output_dir / args.view_name
-    build_dashboard(dashboard_rows, output_dir / "dashboard.png")
+    build_dashboard(dashboard_rows, output_dir / "dashboard.png", row_titles=row_titles)
 
     # Save npz with raw data
     npz_data = {
@@ -501,7 +568,6 @@ def _run_analysis(pipeline, original_state, device, args):
     for v_idx in range(num_versions):
         npz_data[f"version_{v_idx}_target"] = version_target_images[v_idx].astype(np.float32)
         npz_data[f"version_{v_idx}_render"] = version_renders[v_idx].astype(np.float32)
-        npz_data[f"version_{v_idx}_cosine_sim"] = cosine_sims[v_idx].cpu().numpy()
     for group in args.trainable:
         npz_data[f"variance_{group}"] = variance_maps[group].cpu().numpy()
     npz_data["variance_total"] = total_var.cpu().numpy()
