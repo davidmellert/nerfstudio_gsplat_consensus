@@ -38,6 +38,8 @@ def build_trainer_from_spec(spec: Dict) -> Tuple[Trainer, Dict]:
     config.vis = None
     config.viewer.quit_on_train_completion = True
     config.machine.device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    # Images are already at correct resolution via images_path, so disable auto-downscaling
+    config.downscale_factor = None
 
     # Set trainable param groups so train_iteration uses the right code path
     trainable = spec.get("trainable", ["features_dc", "features_rest", "opacities"])
