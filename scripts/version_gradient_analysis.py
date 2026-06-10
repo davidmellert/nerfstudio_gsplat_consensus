@@ -241,7 +241,7 @@ def add_colorbar(image: np.ndarray, lower: float, upper: float, bar_width: int =
 
     h, w = image.shape[:2]
     # Create colorbar gradient (turbo colormap, vertical)
-    gradient = torch.linspace(1, 0, h).unsqueeze(-1)  # top=high, bottom=low
+    gradient = torch.linspace(1, 0, h).view(h, 1, 1)  # [H, 1, 1] — top=high, bottom=low
     options = colormaps.ColormapOptions(colormap="turbo", normalize=False)
     bar = colormaps.apply_colormap(gradient, colormap_options=options).numpy()  # [H, 1, 3]
     bar = np.repeat(bar, bar_width, axis=1)  # [H, bar_width, 3]
