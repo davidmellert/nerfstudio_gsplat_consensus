@@ -177,7 +177,7 @@ class SplatfactoModelConfig(ModelConfig):
     """Number of edited training views to render before one optimizer step."""
     gaussian_consensus_max_views_per_gaussian: int = 0
     """Maximum visible views that can influence one Gaussian per step. If 0, use all visible views."""
-    gaussian_consensus_view_sampling: Literal["global", "pose_neighborhood"] = "pose_neighborhood"
+    gaussian_consensus_view_sampling: Literal["global", "pose_neighborhood", "lookat_twostage"] = "pose_neighborhood"
     """How to sample the edited views used in one consensus optimizer step."""
     gaussian_consensus_neighbor_pool_size: int = 16
     """Number of nearest edited train views to sample extra consensus views from."""
@@ -690,6 +690,7 @@ class SplatfactoModel(Model):
         H: int,
         scalar_attributes: Dict[str, torch.Tensor],
         rgb_attributes: Dict[str, torch.Tensor],
+        active_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         rendered_outputs: Dict[str, torch.Tensor] = {}
         if means.shape[0] == 0:
@@ -697,7 +698,15 @@ class SplatfactoModel(Model):
 
         eps = self.config.gaussian_consensus_eps
 
+        if active_mask is not None:
+            active_mask = active_mask.to(device=opacities.device)
+            opacities = opacities.clone()
+            opacities[~active_mask] = -1e10  # sigmoid(-1e10) ≈ 0
+
+        alpha_map = None
+
         def rasterize_colors(colors: torch.Tensor) -> torch.Tensor:
+            nonlocal alpha_map
             render, alpha, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
                 means=means,
                 quats=quats,
@@ -717,10 +726,13 @@ class SplatfactoModel(Model):
                 absgrad=False,
                 rasterize_mode=self.config.rasterize_mode,
             )
+            if alpha_map is None:
+                alpha_map = (alpha.squeeze(0) > eps).float()[..., :1]
+            nan_fill = torch.full_like(render, float("nan"))
             return torch.where(
                 alpha > eps,
                 render / alpha.clamp_min(eps),
-                torch.zeros_like(render),
+                nan_fill,
             ).squeeze(0)
 
         scalar_items: List[Tuple[str, torch.Tensor]] = []
@@ -744,6 +756,9 @@ class SplatfactoModel(Model):
                 continue
             rendered_outputs[name] = rasterize_colors(value[:, :3])
 
+        if alpha_map is not None:
+            rendered_outputs["_alpha"] = alpha_map
+
         return rendered_outputs
 
     @torch.no_grad()
@@ -752,6 +767,7 @@ class SplatfactoModel(Model):
         camera: Cameras,
         scalar_attributes: Dict[str, torch.Tensor],
         rgb_attributes: Dict[str, torch.Tensor],
+        active_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Render arbitrary per-Gaussian attributes into one camera for offline diagnostics."""
         if not isinstance(camera, Cameras) or self.num_points == 0:
@@ -780,6 +796,8 @@ class SplatfactoModel(Model):
             rgb_attributes = {
                 name: value[crop_ids] for name, value in rgb_attributes.items() if value.shape[0] == self.num_points
             }
+            if active_mask is not None and active_mask.shape[0] == self.num_points:
+                active_mask = active_mask[crop_ids]
         else:
             means = self.means
             quats = self.quats
@@ -804,6 +822,7 @@ class SplatfactoModel(Model):
             H=H,
             scalar_attributes=scalar_attributes,
             rgb_attributes=rgb_attributes,
+            active_mask=active_mask,
         )
 
     @torch.no_grad()

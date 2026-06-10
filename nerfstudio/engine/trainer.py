@@ -692,8 +692,11 @@ class Trainer:
         value = value.detach().cpu().float()
         if value.ndim == 2:
             value = value[..., None]
+        bg_mask = torch.isnan(value[..., 0])
         if "opacity_update" in name:
-            return Trainer._signed_array_to_rgb(value.numpy(), scale=signed_scale)
+            result = Trainer._signed_array_to_rgb(value.numpy(), scale=signed_scale)
+            result[bg_mask.numpy()] = 0.5
+            return result
         normalize = name not in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}
         if value_range is not None:
             min_value, max_value = value_range
@@ -701,15 +704,24 @@ class Trainer:
             value = torch.nan_to_num(value, nan=0.0, posinf=float(max_value), neginf=float(min_value))
             value = torch.clamp((value - float(min_value)) / denominator, 0.0, 1.0)
             normalize = False
+        else:
+            value = torch.nan_to_num(value, nan=0.0)
         options = colormaps.ColormapOptions(colormap="turbo", normalize=normalize)
-        return colormaps.apply_colormap(value, colormap_options=options).cpu().numpy()
+        result = colormaps.apply_colormap(value, colormap_options=options).cpu().numpy()
+        result[bg_mask.numpy()] = 0.5
+        return result
 
     @staticmethod
     def _rgb_tensor_to_panel_image(name: str, value: torch.Tensor, signed_scale: Optional[float] = None) -> np.ndarray:
         array = value.detach().cpu().float().numpy()
+        bg_mask = np.isnan(array[..., 0])
         if "update" in name:
-            return Trainer._signed_array_to_rgb(array, scale=signed_scale)
-        return np.clip(array, 0.0, 1.0)
+            result = Trainer._signed_array_to_rgb(np.nan_to_num(array, nan=0.0), scale=signed_scale)
+            result[bg_mask] = 0.5
+            return result
+        result = np.clip(np.nan_to_num(array, nan=0.0), 0.0, 1.0)
+        result[bg_mask] = 0.5
+        return result
 
     @staticmethod
     def _write_png(path: Path, image: np.ndarray) -> None:
@@ -797,6 +809,14 @@ class Trainer:
             if image is not None:
                 norm_row.append((label, image))
 
+        cosine_row: List[Tuple[str, np.ndarray]] = []
+        for view_idx in range(num_views):
+            name = f"view_cosine_sim_{view_idx:02d}"
+            image = get_panel(name)
+            if image is not None:
+                label = "anchor" if view_idx == 0 else f"ref {view_idx}"
+                cosine_row.append((f"cos {label}", image))
+
         agreement_row: List[Tuple[str, np.ndarray]] = []
         for label, name in (
             ("visible views", "visible_view_count"),
@@ -823,7 +843,7 @@ class Trainer:
             if image is not None:
                 direction_row.append((label, image))
 
-        dashboard_rows = [row for row in (input_row, norm_row, agreement_row, direction_row) if len(row) > 0]
+        dashboard_rows = [row for row in (input_row, norm_row, cosine_row, agreement_row, direction_row) if len(row) > 0]
         Trainer._write_dashboard(step_dir / "preview_dashboard.png", dashboard_rows)
 
     @staticmethod
@@ -870,9 +890,14 @@ class Trainer:
         if len(per_gaussian) == 0:
             return
 
+        active_mask = per_gaussian.get("visible_counts", None)
+        if active_mask is not None:
+            active_mask = (active_mask > 0)
+
         anchor_camera = view_records[0]["camera"]
         rendered_maps = self.pipeline.model.render_gaussian_attribute_maps_for_camera(
-            anchor_camera, scalar_attributes=scalar_attributes, rgb_attributes=rgb_attributes
+            anchor_camera, scalar_attributes=scalar_attributes, rgb_attributes=rgb_attributes,
+            active_mask=active_mask,
         )
 
         output_root = self.base_dir / str(getattr(config, "gaussian_consensus_visualization_output_dir", "consensus_visualizations"))
@@ -916,6 +941,10 @@ class Trainer:
         max_view_index = max(1, len(view_records) - 1)
         max_visible_count = max(1, len(view_records))
 
+        alpha_map = rendered_maps.pop("_alpha", None)
+        if alpha_map is not None:
+            npz_arrays["map___alpha"] = self._tensor_to_npz_array(alpha_map)
+
         for name, value in rendered_maps.items():
             npz_arrays[f"map__{name}"] = self._tensor_to_npz_array(value)
             scalar_range: Optional[Tuple[float, float]] = None
@@ -923,7 +952,21 @@ class Trainer:
             if self._is_update_norm_map(name):
                 scalar_range = (0.0, norm_scale_max)
                 panel_scales[name] = self._scale_record("linear", 0.0, norm_scale_max)
-            elif name in {"agreement", "disagreement", "dominance_strength", "suppression_ratio"}:
+            elif name in {"agreement", "disagreement"}:
+                finite_vals = value[torch.isfinite(value)]
+                lower = float(finite_vals.min()) if finite_vals.numel() > 0 else 0.0
+                upper = float(finite_vals.max()) if finite_vals.numel() > 0 else 1.0
+                upper = max(upper, lower + 1e-8)
+                scalar_range = (lower, upper)
+                panel_scales[name] = self._scale_record("linear", lower, upper)
+            elif "cosine_sim" in name:
+                finite_vals = value[torch.isfinite(value)]
+                lower = float(finite_vals.min()) if finite_vals.numel() > 0 else -1.0
+                upper = float(finite_vals.max()) if finite_vals.numel() > 0 else 1.0
+                upper = max(upper, lower + 1e-8)
+                scalar_range = (lower, upper)
+                panel_scales[name] = self._scale_record("linear", lower, upper)
+            elif name in {"dominance_strength", "suppression_ratio"}:
                 scalar_range = (0.0, 1.0)
                 panel_scales[name] = self._scale_record("linear", 0.0, 1.0)
             elif name == "visible_view_count":

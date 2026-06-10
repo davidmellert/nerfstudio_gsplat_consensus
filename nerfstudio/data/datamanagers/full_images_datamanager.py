@@ -469,10 +469,46 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             ordered = ordered[:neighbor_pool_size]
         return [int(idx) for idx in ordered if idx != anchor_idx]
 
+    def _get_lookat_neighbor_indices(
+        self,
+        anchor_idx: int,
+        num_refs: int,
+    ) -> List[int]:
+        """Two-stage view selection: filter by look-at point similarity, then rank by position.
+
+        Stage 1: Find cameras whose look-at points are closest to the anchor's look-at point.
+                 The look-at point is computed by projecting the camera forward (along its actual
+                 viewing direction) by the camera's distance to the scene center.
+                 Pool size = 4 * num_refs.
+        Stage 2: Rank the pool by position distance, take the top num_refs deterministically.
+        """
+        camera_to_worlds = self.train_dataset.cameras.camera_to_worlds.float()
+        origins = camera_to_worlds[..., 3]
+        # Negate z-axis: after COLMAP->OpenGL convention flip, z points backward
+        viewing_dirs = -torch.nn.functional.normalize(camera_to_worlds[..., :3, 2], dim=-1)
+        scene_center = origins.mean(dim=0)
+
+        # Compute look-at points
+        t = torch.linalg.norm(origins - scene_center.unsqueeze(0), dim=-1)
+        look_at_points = origins + t.unsqueeze(-1) * viewing_dirs
+
+        # Stage 1: top pool by look-at distance
+        anchor_look_at = look_at_points[anchor_idx]
+        lookat_distances = torch.linalg.norm(look_at_points - anchor_look_at, dim=-1)
+        lookat_distances[anchor_idx] = torch.inf
+        pool_size = min(4 * num_refs, len(self.train_dataset) - 1)
+        lookat_pool = torch.argsort(lookat_distances)[:pool_size].tolist()
+
+        # Stage 2: rank pool by position distance, take top num_refs
+        anchor_origin = origins[anchor_idx]
+        position_distances = torch.linalg.norm(origins - anchor_origin, dim=-1)
+        pool_sorted = sorted(lookat_pool, key=lambda i: position_distances[i].item())
+        return pool_sorted[:num_refs]
+
     def sample_train_view_indices(
         self,
         num_views: int,
-        sampling_strategy: Literal["global", "pose_neighborhood"] = "global",
+        sampling_strategy: Literal["global", "pose_neighborhood", "lookat_twostage"] = "global",
         neighbor_pool_size: int = 16,
         position_weight: float = 1.0,
         direction_weight: float = 0.25,
@@ -487,7 +523,13 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
             return image_indices
 
         rng = self._consensus_random_generator()
-        if sampling_strategy == "pose_neighborhood":
+        if sampling_strategy == "lookat_twostage":
+            neighbor_indices = self._get_lookat_neighbor_indices(
+                anchor_idx=anchor_idx,
+                num_refs=num_views - 1,
+            )
+            image_indices.extend(neighbor_indices)
+        elif sampling_strategy == "pose_neighborhood":
             neighbor_indices = self._get_pose_neighbor_indices(
                 anchor_idx=anchor_idx,
                 neighbor_pool_size=neighbor_pool_size,
@@ -516,7 +558,7 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         self,
         step: int,
         num_views: int,
-        sampling_strategy: Literal["global", "pose_neighborhood"] = "global",
+        sampling_strategy: Literal["global", "pose_neighborhood", "lookat_twostage"] = "global",
         neighbor_pool_size: int = 16,
         position_weight: float = 1.0,
         direction_weight: float = 0.25,
