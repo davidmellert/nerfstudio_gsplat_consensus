@@ -264,19 +264,89 @@ def build_dashboard(rows: List[List[Tuple[str, np.ndarray]]], output_path: Path)
     print(f"Dashboard saved to {output_path}")
 
 
+def load_yaml_config(config_path: Path) -> Dict:
+    """Load a YAML analysis config file."""
+    import yaml
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def resolve_versions(versions_dir: Path, view_name: str, num_versions: int) -> List[Path]:
+    """Find version image files for a view in a directory."""
+    paths = []
+    for v_idx in range(num_versions):
+        candidates = list(versions_dir.glob(f"{view_name}_{v_idx}.*"))
+        if not candidates:
+            candidates = list(versions_dir.glob(f"*{view_name}_{v_idx}.*"))
+        if not candidates:
+            raise FileNotFoundError(f"No image found for {view_name}_{v_idx} in {versions_dir}")
+        paths.append(candidates[0])
+    return paths
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--load-config", type=Path, required=True, help="Path to a trained config.yml")
-    parser.add_argument("--view-name", type=str, required=True, help="Camera name to analyze (partial match)")
-    parser.add_argument("--versions", type=Path, nargs="+", required=True, help="Edited image paths (one per version)")
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/version_analysis"), help="Output directory")
-    parser.add_argument("--trainable", type=str, nargs="+", default=["features_dc", "features_rest", "opacities"])
-    parser.add_argument("--lr", type=float, default=None, help="Learning rate override (uses optimizer LR if not set)")
-    args = parser.parse_args()
+    parser.add_argument("--config", type=Path, default=None, help="YAML analysis config file")
+    parser.add_argument("--load-config", type=Path, default=None, help="Path to a trained config.yml")
+    parser.add_argument("--view-name", type=str, default=None, help="Camera name to analyze (partial match)")
+    parser.add_argument("--versions", type=Path, nargs="+", default=None, help="Edited image paths (one per version)")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory")
+    parser.add_argument("--trainable", type=str, nargs="+", default=None)
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    cli_args = parser.parse_args()
 
-    print(f"Loading pipeline from {args.load_config}...")
-    config, pipeline, original_state = load_trainer_and_pipeline(args.load_config)
+    # Load from YAML config if provided
+    if cli_args.config is not None:
+        cfg = load_yaml_config(cli_args.config)
+    else:
+        cfg = {}
+
+    load_config = cli_args.load_config or Path(cfg["load_config"])
+    output_dir = cli_args.output_dir or Path(cfg.get("output_dir", "outputs/version_analysis"))
+    trainable = cli_args.trainable or cfg.get("trainable", ["features_dc", "features_rest", "opacities"])
+    lr_override = cli_args.lr or cfg.get("lr", None)
+    num_versions = cfg.get("num_versions", 3)
+    versions_dir = Path(cfg["versions_dir"]) if "versions_dir" in cfg else None
+
+    # Determine which views to analyze
+    if cli_args.view_name:
+        view_names = [cli_args.view_name]
+    elif "views" in cfg:
+        view_names = cfg["views"]
+    elif "view_name" in cfg:
+        view_names = [cfg["view_name"]]
+    else:
+        raise ValueError("Specify --view-name or views in the YAML config")
+
+    print(f"Loading pipeline from {load_config}...")
+    config, pipeline, original_state = load_trainer_and_pipeline(load_config)
     device = next(pipeline.model.parameters()).device
+
+    for view_name in view_names:
+        print(f"\n{'='*60}")
+        print(f"Analyzing view: {view_name}")
+        print(f"{'='*60}")
+
+        # Resolve version image paths
+        if cli_args.versions:
+            version_paths = cli_args.versions
+        elif versions_dir is not None:
+            version_paths = resolve_versions(versions_dir, view_name, num_versions)
+        else:
+            raise ValueError("Specify --versions or versions_dir in YAML config")
+
+        args = argparse.Namespace(
+            view_name=view_name,
+            versions=version_paths,
+            output_dir=output_dir,
+            trainable=trainable,
+            lr=lr_override,
+        )
+        _run_analysis(config, pipeline, original_state, device, args)
+
+
+def _run_analysis(config, pipeline, original_state, device, args):
+    """Run the analysis for a single view."""
 
     cam_idx = find_camera_index(pipeline, args.view_name)
     dm = pipeline.datamanager
