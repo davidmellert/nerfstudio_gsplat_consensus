@@ -1,23 +1,29 @@
 # Run with: python scripts/version_gradient_analysis.py --config configs/experiments/version_analysis_tobi.yml
 
-# Path to config.yml from the base pretrained run
-load_config: outputs/bicycle/splatfacto-colmap/2026-06-02_180954/config.yml
+method: splatfacto-colmap
+data: /mnt/hdd/data/bicycle
+downscale_factor: 8
+load_dir: outputs/bicycle/splatfacto-colmap/2026-06-02_180954/nerfstudio_models
+load_step: 14999
 
-# Directory containing version images named like: _DSC8685_0.JPG, _DSC8685_1.JPG, _DSC8685_2.JPG
+dataparser:
+  images_path: images_sunset_8
+  skip_missing_images: true
+  auto_downscale_missing_images: false
+  eval_mode: all
+
+datamanager:
+  cache_images: cpu
+
 versions_dir: /mnt/hdd/data/bicycle/images_sunset_versions_8
-
-# Number of versions per view
 num_versions: 3
 
-# Which views to analyze (partial name match against colmap image names)
 views:
   - _DSC8685
 
-# Parameters to train (color + opacity only)
 trainable:
   - features_dc
   - features_rest
   - opacities
 
-# Output directory for dashboards and npz data
 output_dir: outputs/version_analysis

@@ -28,24 +28,22 @@ import torch.nn.functional as F
 from PIL import Image
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.configs.config_utils import convert_markup_to_ansi
-from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils import colormaps
 
 
-def load_trainer_and_pipeline(config_path: Path) -> Tuple[TrainerConfig, VanillaPipeline, Dict]:
-    """Load a trained pipeline from a config.yml path."""
-    import yaml
+def build_pipeline_from_spec(spec: Dict) -> Tuple[VanillaPipeline, Dict]:
+    """Build and load a pipeline from a YAML spec (same fields as experiment configs)."""
+    import os
+    from nerfstudio.scripts.experiment import _load_base_config, _apply_common_overrides, _set_datamanager_data
 
-    config = yaml.load(config_path.read_text(), Loader=yaml.Loader)
-    assert isinstance(config, TrainerConfig)
+    config = _load_base_config(spec)
+    _apply_common_overrides(config, spec)
 
     config.vis = None
     config.viewer.quit_on_train_completion = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config.pipeline.device = device
     config.machine.device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
     pipeline = config.pipeline.setup(device=device, test_mode="test")
@@ -55,8 +53,8 @@ def load_trainer_and_pipeline(config_path: Path) -> Tuple[TrainerConfig, Vanilla
     load_dir = config.load_dir
     load_step = config.load_step
     if load_dir is not None:
+        load_dir = Path(load_dir)
         if load_step is None:
-            import os
             load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
         load_path = load_dir / f"step-{load_step:09d}.ckpt"
         assert load_path.exists(), f"Checkpoint {load_path} does not exist"
@@ -67,6 +65,8 @@ def load_trainer_and_pipeline(config_path: Path) -> Tuple[TrainerConfig, Vanilla
         loaded_state = torch.load(config.load_checkpoint, map_location="cpu")
         pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
         print(f"Loaded checkpoint from {config.load_checkpoint}")
+    else:
+        raise ValueError("Either load_dir or load_checkpoint must be specified")
 
     # Save original state for resetting between versions
     original_state = {
@@ -74,7 +74,7 @@ def load_trainer_and_pipeline(config_path: Path) -> Tuple[TrainerConfig, Vanilla
         for name, param in pipeline.model.gauss_params.items()
     }
 
-    return config, pipeline, original_state
+    return pipeline, original_state
 
 
 def find_camera_index(pipeline: VanillaPipeline, view_name: str) -> int:
@@ -286,22 +286,15 @@ def resolve_versions(versions_dir: Path, view_name: str, num_versions: int) -> L
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=None, help="YAML analysis config file")
-    parser.add_argument("--load-config", type=Path, default=None, help="Path to a trained config.yml")
-    parser.add_argument("--view-name", type=str, default=None, help="Camera name to analyze (partial match)")
-    parser.add_argument("--versions", type=Path, nargs="+", default=None, help="Edited image paths (one per version)")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory")
+    parser.add_argument("--config", type=Path, required=True, help="YAML analysis config file")
+    parser.add_argument("--view-name", type=str, default=None, help="Override view to analyze")
+    parser.add_argument("--versions", type=Path, nargs="+", default=None, help="Override version image paths")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Override output directory")
     parser.add_argument("--trainable", type=str, nargs="+", default=None)
     parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
     cli_args = parser.parse_args()
 
-    # Load from YAML config if provided
-    if cli_args.config is not None:
-        cfg = load_yaml_config(cli_args.config)
-    else:
-        cfg = {}
-
-    load_config = cli_args.load_config or Path(cfg["load_config"])
+    cfg = load_yaml_config(cli_args.config)
     output_dir = cli_args.output_dir or Path(cfg.get("output_dir", "outputs/version_analysis"))
     trainable = cli_args.trainable or cfg.get("trainable", ["features_dc", "features_rest", "opacities"])
     lr_override = cli_args.lr or cfg.get("lr", None)
@@ -318,8 +311,8 @@ def main():
     else:
         raise ValueError("Specify --view-name or views in the YAML config")
 
-    print(f"Loading pipeline from {load_config}...")
-    config, pipeline, original_state = load_trainer_and_pipeline(load_config)
+    print("Building pipeline...")
+    pipeline, original_state = build_pipeline_from_spec(cfg)
     device = next(pipeline.model.parameters()).device
 
     for view_name in view_names:
@@ -342,10 +335,10 @@ def main():
             trainable=trainable,
             lr=lr_override,
         )
-        _run_analysis(config, pipeline, original_state, device, args)
+        _run_analysis(pipeline, original_state, device, args)
 
 
-def _run_analysis(config, pipeline, original_state, device, args):
+def _run_analysis(pipeline, original_state, device, args):
     """Run the analysis for a single view."""
 
     cam_idx = find_camera_index(pipeline, args.view_name)
