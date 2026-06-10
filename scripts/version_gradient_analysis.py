@@ -117,7 +117,7 @@ def patch_next_train(trainer: Trainer, cam_idx: int, target_image: torch.Tensor)
 
     def fixed_next_train(step):
         dm.train_count += 1
-        camera = dm.train_cameras[cam_idx : cam_idx + 1].to(device)
+        camera = dm.train_dataset.cameras[cam_idx : cam_idx + 1].to(device)
         if camera.metadata is None:
             camera.metadata = {}
         camera.metadata["cam_idx"] = cam_idx
