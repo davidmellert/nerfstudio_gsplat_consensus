@@ -113,6 +113,9 @@ def run_single_step(
         for name, param in pipeline.model.gauss_params.items():
             param.copy_(original_state[name])
 
+    # Disable refinement so strategy.step_pre_backward is not called
+    pipeline.model.config.gaussian_disable_refinement = True
+
     # Enable gradients only for trainable groups
     for name, param in pipeline.model.gauss_params.items():
         param.requires_grad_(name in trainable_groups)
