@@ -25,7 +25,8 @@ from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.engine.callbacks import TrainingCallbackLocation
 from nerfstudio.engine.trainer import Trainer
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
-from nerfstudio.utils import colormaps
+from nerfstudio.utils import colormaps, writer
+from nerfstudio.utils.writer import EventName, TimeWriter
 
 
 def build_trainer_from_spec(spec: Dict) -> Tuple[Trainer, Dict]:
@@ -142,23 +143,34 @@ def run_training_steps(
     start_step = original_state["_start_step"]
     for step_offset in range(num_steps):
         step = start_step + step_offset
-        trainer.pipeline.train()
+        with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
+            trainer.pipeline.train()
 
-        # Run callbacks (needed for gsplat strategy)
-        for callback in trainer.callbacks:
-            callback.run_callback_at_location(
-                step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION,
+            for callback in trainer.callbacks:
+                callback.run_callback_at_location(
+                    step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION,
+                )
+
+            loss, loss_dict, metrics_dict = trainer.train_iteration(step)
+
+            for callback in trainer.callbacks:
+                callback.run_callback_at_location(
+                    step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION,
+                )
+
+        if step_offset > 0:
+            writer.put_time(
+                name=EventName.TRAIN_RAYS_PER_SEC,
+                duration=trainer.pipeline.datamanager.get_train_rays_per_batch()
+                / max(0.001, train_t.duration),
+                step=step,
+                avg_over_steps=True,
             )
-
-        loss, loss_dict, metrics_dict = trainer.train_iteration(step)
-
-        for callback in trainer.callbacks:
-            callback.run_callback_at_location(
-                step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION,
-            )
-
-        if step_offset % 50 == 0 or step_offset == num_steps - 1:
-            print(f"  step {step_offset+1}/{num_steps}, loss={loss:.6f}")
+        if step_offset % trainer.config.logging.steps_per_log == 0:
+            writer.put_scalar(name="Train Loss", scalar=loss, step=step)
+            writer.put_dict(name="Train Loss Dict", scalar_dict=loss_dict, step=step)
+            writer.put_dict(name="Train Metrics Dict", scalar_dict=metrics_dict, step=step)
+        writer.write_out_storage()
 
     # Collect final params
     updated = {}
