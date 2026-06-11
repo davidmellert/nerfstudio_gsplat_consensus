@@ -128,6 +128,36 @@ def patch_next_train(trainer: Trainer, cam_idx: int, target_image: torch.Tensor)
     dm.next_train = fixed_next_train
 
 
+def _run_one_train_step(trainer: Trainer, step: int):
+    """Run a single train iteration with callbacks and logging."""
+    with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
+        trainer.pipeline.train()
+        for callback in trainer.callbacks:
+            callback.run_callback_at_location(
+                step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION,
+            )
+        loss, loss_dict, metrics_dict = trainer.train_iteration(step)
+        for callback in trainer.callbacks:
+            callback.run_callback_at_location(
+                step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION,
+            )
+
+    if step > trainer._start_step:
+        writer.put_time(
+            name=EventName.TRAIN_RAYS_PER_SEC,
+            duration=trainer.pipeline.datamanager.get_train_rays_per_batch()
+            / max(0.001, train_t.duration),
+            step=step,
+            avg_over_steps=True,
+        )
+    if (step - trainer._start_step) % trainer.config.logging.steps_per_log == 0:
+        writer.put_scalar(name="Train Loss", scalar=loss, step=step)
+        writer.put_dict(name="Train Loss Dict", scalar_dict=loss_dict, step=step)
+        writer.put_dict(name="Train Metrics Dict", scalar_dict=metrics_dict, step=step)
+    writer.write_out_storage()
+    return loss, loss_dict, metrics_dict
+
+
 def run_training_steps(
     trainer: Trainer,
     cam_idx: int,
@@ -135,44 +165,72 @@ def run_training_steps(
     original_state: Dict,
     num_steps: int,
     trainable_groups: List[str],
-) -> Dict[str, torch.Tensor]:
-    """Run N real training steps using the Trainer's train_iteration, return final params."""
+    capture_first_step_grads: bool = False,
+) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+    """Run N real training steps. Returns (final_params, first_step_grad_norms).
+
+    If capture_first_step_grads is True, returns per-Gaussian gradient norms from step 1.
+    """
     reset_trainer(trainer, original_state)
     patch_next_train(trainer, cam_idx, target_image)
+
+    first_step_grad_norms = None
+    start_step = original_state["_start_step"]
+    num_gaussians = trainer.pipeline.model.num_points
+
+    for step_offset in range(num_steps):
+        step = start_step + step_offset
+        loss, _, _ = _run_one_train_step(trainer, step)
+
+        # Capture gradient norms after the very first backward pass
+        if step_offset == 0 and capture_first_step_grads:
+            grad_norm = torch.zeros(num_gaussians, device=trainer.device)
+            for name in trainable_groups:
+                param = trainer.pipeline.model.gauss_params[name]
+                if param.grad is not None:
+                    flat = param.grad.detach().reshape(num_gaussians, -1).float()
+                    grad_norm += flat.norm(dim=-1)
+            first_step_grad_norms = grad_norm
+
+    # Collect final params
+    updated = {}
+    for name in trainable_groups:
+        updated[name] = trainer.pipeline.model.gauss_params[name].detach().clone()
+    return updated, first_step_grad_norms
+
+
+def run_rotating_training(
+    trainer: Trainer,
+    cam_idx: int,
+    target_images: List[torch.Tensor],
+    original_state: Dict,
+    num_steps: int,
+    trainable_groups: List[str],
+) -> Dict[str, torch.Tensor]:
+    """Run N training steps, rotating through the target images each step."""
+    reset_trainer(trainer, original_state)
+    dm = trainer.pipeline.datamanager
+    device_str = trainer.device
+    num_versions = len(target_images)
+
+    # Monkey-patch next_train to cycle through versions
+    def rotating_next_train(step):
+        dm.train_count += 1
+        v_idx = (step - original_state["_start_step"]) % num_versions
+        camera = dm.train_dataset.cameras[cam_idx : cam_idx + 1].to(device_str)
+        if camera.metadata is None:
+            camera.metadata = {}
+        camera.metadata["cam_idx"] = cam_idx
+        data = {"image": target_images[v_idx].to(device_str)}
+        return camera, data
+
+    dm.next_train = rotating_next_train
 
     start_step = original_state["_start_step"]
     for step_offset in range(num_steps):
         step = start_step + step_offset
-        with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
-            trainer.pipeline.train()
+        _run_one_train_step(trainer, step)
 
-            for callback in trainer.callbacks:
-                callback.run_callback_at_location(
-                    step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION,
-                )
-
-            loss, loss_dict, metrics_dict = trainer.train_iteration(step)
-
-            for callback in trainer.callbacks:
-                callback.run_callback_at_location(
-                    step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION,
-                )
-
-        if step_offset > 0:
-            writer.put_time(
-                name=EventName.TRAIN_RAYS_PER_SEC,
-                duration=trainer.pipeline.datamanager.get_train_rays_per_batch()
-                / max(0.001, train_t.duration),
-                step=step,
-                avg_over_steps=True,
-            )
-        if step_offset % trainer.config.logging.steps_per_log == 0:
-            writer.put_scalar(name="Train Loss", scalar=loss, step=step)
-            writer.put_dict(name="Train Loss Dict", scalar_dict=loss_dict, step=step)
-            writer.put_dict(name="Train Metrics Dict", scalar_dict=metrics_dict, step=step)
-        writer.write_out_storage()
-
-    # Collect final params
     updated = {}
     for name in trainable_groups:
         updated[name] = trainer.pipeline.model.gauss_params[name].detach().clone()
@@ -448,20 +506,32 @@ def _run_analysis(trainer, original_state, device, view_name, version_paths,
     print(f"Analyzing {num_versions} versions, {num_gaussians} Gaussians")
     print(f"Training steps per version: {num_steps}")
 
-    # Per-version: run real training steps and collect final params
+    # Per-version: run real training steps and collect final params + first-step grad norms
     all_updated_params: List[Dict[str, torch.Tensor]] = []
+    all_first_grad_norms: List[torch.Tensor] = []
     version_target_images: List[np.ndarray] = []
+    loaded_target_tensors: List[torch.Tensor] = []
 
     for v_idx, version_path in enumerate(version_paths):
         print(f"\nVersion {v_idx}: {version_path.name}")
         target_image = load_edited_image(version_path, h, w)
         version_target_images.append(target_image.numpy())
+        loaded_target_tensors.append(target_image)
 
-        updated = run_training_steps(
+        updated, first_grad_norms = run_training_steps(
             trainer, cam_idx, target_image, original_state,
             num_steps=num_steps, trainable_groups=trainable,
+            capture_first_step_grads=True,
         )
         all_updated_params.append(updated)
+        all_first_grad_norms.append(first_grad_norms)
+
+    # Run rotating-versions training (cycle v0, v1, v2, v0, ...)
+    print(f"\nRotating versions training ({num_steps} steps)...")
+    rotating_updated = run_rotating_training(
+        trainer, cam_idx, loaded_target_tensors, original_state,
+        num_steps=num_steps, trainable_groups=trainable,
+    )
 
     # Render per-version results
     version_renders: List[np.ndarray] = []
@@ -477,6 +547,10 @@ def _run_analysis(trainer, original_state, device, view_name, version_paths,
         mean_updated[group] = stacked.mean(dim=0)
     print("Rendering mean version...")
     mean_render = render_with_params(pipeline, camera, mean_updated, original_state)
+
+    # Render rotating result
+    print("Rendering rotating version...")
+    rotating_render = render_with_params(pipeline, camera, rotating_updated, original_state)
 
     # Compute per-Gaussian variance for each group
     variance_maps = {}
@@ -498,9 +572,18 @@ def _run_analysis(trainer, original_state, device, view_name, version_paths,
 
     print(f"Active Gaussians: {active_mask.sum().item()}/{num_gaussians}")
 
-    # Render variance maps (with colorbar)
-    # Reset to original state for rendering
+    # Render attribute maps (reset to original geometry)
     reset_trainer(trainer, original_state)
+
+    # Render first-step gradient norm maps (with colorbar)
+    rendered_grad_maps = []
+    for v_idx, grad_norms in enumerate(all_first_grad_norms):
+        img, lo, hi = render_attribute_map(
+            pipeline, camera, grad_norms, original_state, active_mask=active_mask
+        )
+        rendered_grad_maps.append(add_colorbar(img, lo, hi))
+
+    # Render variance maps (with colorbar)
     rendered_var_maps = {}
     for group, var_tensor in variance_maps.items():
         img, lo, hi = render_attribute_map(
@@ -513,23 +596,32 @@ def _run_analysis(trainer, original_state, device, view_name, version_paths,
     rendered_var_maps["total"] = add_colorbar(img, lo, hi)
 
     # Build dashboard
-    row1 = [("Original Render", original_rgb)]
+    # Row 1: Inputs
+    row_inputs = [("Original Render", original_rgb)]
     for v_idx, img in enumerate(version_target_images):
-        row1.append((f"Edit Version {v_idx}", img))
+        row_inputs.append((f"Edit Version {v_idx}", img))
 
-    row2 = []
+    # Row 2: First-step gradient norms
+    row_grads = []
+    for v_idx, grad_img in enumerate(rendered_grad_maps):
+        row_grads.append((f"Grad Norm Step 1 (v{v_idx})", grad_img))
+
+    # Row 3: Renders after N steps (per-version + mean + rotating)
+    row_renders = []
     for v_idx, rgb in enumerate(version_renders):
-        row2.append((f"After {num_steps} Steps (v{v_idx})", rgb))
-    row2.append(("Mean of All Versions", mean_render))
+        row_renders.append((f"After {num_steps} Steps (v{v_idx})", rgb))
+    row_renders.append(("Mean of Versions", mean_render))
+    row_renders.append(("Rotating Versions", rotating_render))
 
-    row3 = []
+    # Row 4: Variance maps
+    row_var = []
     for group in trainable:
         short = group.replace("features_", "")
-        row3.append((f"Variance: {short}", rendered_var_maps[group]))
-    row3.append(("Variance: Total", rendered_var_maps["total"]))
+        row_var.append((f"Variance: {short}", rendered_var_maps[group]))
+    row_var.append(("Variance: Total", rendered_var_maps["total"]))
 
-    dashboard_rows = [row for row in [row1, row2, row3] if row]
-    row_titles = ["Inputs", "Renders", "Variance"]
+    dashboard_rows = [row for row in [row_inputs, row_grads, row_renders, row_var] if row]
+    row_titles = ["Inputs", "Grad Norm", "Renders", "Variance"]
     out_dir = output_dir / view_name
     build_dashboard(dashboard_rows, out_dir / "dashboard.png", row_titles=row_titles)
 
@@ -537,10 +629,12 @@ def _run_analysis(trainer, original_state, device, view_name, version_paths,
     npz_data = {
         "original_rgb": original_rgb.astype(np.float32),
         "mean_render": mean_render.astype(np.float32),
+        "rotating_render": rotating_render.astype(np.float32),
     }
     for v_idx in range(num_versions):
         npz_data[f"version_{v_idx}_target"] = version_target_images[v_idx].astype(np.float32)
         npz_data[f"version_{v_idx}_render"] = version_renders[v_idx].astype(np.float32)
+        npz_data[f"version_{v_idx}_grad_norm"] = all_first_grad_norms[v_idx].cpu().numpy()
     for group in trainable:
         npz_data[f"variance_{group}"] = variance_maps[group].cpu().numpy()
     npz_data["variance_total"] = total_var.cpu().numpy()
